@@ -162,6 +162,205 @@ Three coupled outputs:
 - Be direct when the chosen pattern is wrong for the workload --
   recommend migration
 
+## Azure Functions & Azure-Specific Serverless
+
+### Azure Functions hosting plans
+
+Azure Functions has three hosting plans with very different cost models:
+
+| Plan | Billing | Cold start | Best for |
+|---|---|---|---|
+| **Consumption** | Per execution + GB-seconds | Yes (~1-3s) | Infrequent, bursty invocations |
+| **Premium** | Per vCPU-second + GB-second (always-warm) | No (pre-warmed) | SLA-sensitive, VNet-required |
+| **Dedicated (App Service)** | Per App Service Plan hour | No | Steady-state, shared with other apps |
+
+**Consumption plan cost formula:**
+
+```text
+cost = (executions × $0.20/million)
+     + (GB-seconds × $0.000016/GB-second)
+```
+
+First 1M executions and 400,000 GB-seconds are free per month.
+For a function running 10M times/month at 200ms with 512 MB:
+`10M × $0.20/1M + (10M × 0.2s × 0.5GB × $0.000016) = $2 + $16 = $18/month`
+
+**Premium plan cost trap:** Premium plan has a minimum of 1 always-warm
+instance. At the smallest SKU (EP1: 1 vCPU, 3.5 GB RAM):
+`$0.173/hour × 730 hours = ~$126/month` floor — regardless of invocations.
+Only justified when cold start latency or VNet integration is required.
+
+**When to leave Consumption:** Over ~$5k/month in Consumption plan,
+evaluate App Service Plan or containerization (Azure Container Apps,
+AKS) — steady high-volume is always cheaper on reserved compute.
+
+### Azure Functions memory sizing (Power Tuning)
+
+Unlike Lambda (where memory directly sets CPU), Azure Functions on
+Consumption plan allocates CPU proportionally to memory. The same
+"right memory" optimization applies:
+
+- More memory → more CPU → faster execution → fewer GB-seconds billed
+- Test at 128 MB, 256 MB, 512 MB, 1024 MB, and 1536 MB (the max)
+- Optimal is rarely the minimum; fast execution often reduces total cost
+
+Use the [Azure Functions Power Tuning](https://github.com/scale-tone/azure-function-power-tuner)
+tool for automated testing — analogous to AWS Lambda Power Tuning.
+
+### Azure Container Apps vs Functions
+
+Azure Container Apps (ACA) is the managed-container alternative to Functions
+for workloads that need longer execution times, custom runtimes, or HTTP-based
+APIs. ACA scales to zero on the Consumption workload profile:
+
+```bash
+# Deploy a containerized workload that scales to zero
+az containerapp create \
+  --name my-api \
+  --resource-group MY-RG \
+  --environment MY-ACA-ENV \
+  --image myregistry.azurecr.io/my-api:latest \
+  --min-replicas 0 \
+  --max-replicas 10 \
+  --target-port 8080 \
+  --ingress external
+```
+
+ACA Consumption billing: `$0.000024/vCPU-second` + `$0.000003/GB-second`
+(same structure as Azure Functions Premium but container-native).
+
+Over $5k/month in Azure Functions: run the ACA vs Functions TCO comparison
+before migrating. The difference is often 20-40% in favor of ACA for
+HTTP APIs with > 100 concurrent requests.
+
+### Azure Durable Functions cost profile
+
+Durable Functions use Azure Storage (queues, tables, blobs) for
+orchestration state. The storage cost is often invisible until scale:
+
+- 1M orchestrations/month with 10 activities each:
+  ~500k queue operations + ~1M table operations + blob storage
+  ≈ ~$15-50/month in storage alone, separate from compute
+- For high-throughput workflows, use the **Netherite storage provider**
+  (backed by Azure Event Hubs) which is faster and cheaper at scale
+
+Always include Storage cost in Durable Functions cost analysis.
+The compute cost is only half the picture.
+
+## GCP Cloud Run & Vertex AI
+
+### Cloud Run cost model
+
+Cloud Run has two CPU allocation modes with dramatically different
+cost profiles:
+
+**CPU throttled (default):**
+- CPU is allocated only during request processing
+- Billed per 100ms of request duration × vCPU + GB-RAM
+- Minimum billing: 1 request at the minimum instance spec
+- Best for: bursty, low-latency workloads with significant idle time
+
+**CPU always allocated (`--cpu-always-allocated`):**
+- CPU allocated continuously, even when no requests are in flight
+- Enables background work, timers, streaming
+- Cost: doubles for idle instances (you pay even with 0 requests)
+- Never use for workloads that don't need continuous CPU; the cost
+  delta is 2-10x for low-traffic services
+
+**Cloud Run billing formula (throttled mode):**
+
+```text
+cost = (CPU_vCPU × $0.00002400/vCPU-second)
+     + (memory_GB × $0.00000250/GB-second)
+     + (requests × $0.00000040 per request)
+```
+
+**Min-instances cost trap:** Each `--min-instances=N` instance
+charges idle CPU + memory continuously even with zero requests. A
+single always-on 1 vCPU / 512 MB Cloud Run service on always-allocated
+costs ~$15/month in idle. 20 services with `--min-instances=1` is
+~$300/month in floor cost before a single request is processed.
+
+Audit — any non-zero value needs a business justification:
+
+```bash
+gcloud run services list --format=json | jq '.[].spec.template.metadata.annotations."autoscaling.knative.dev/minScale"'
+```
+
+**Cloud Run cost decision tree:**
+
+```text
+Is the workload bursty with variable traffic?
+  Yes → CPU throttled, min-instances=0
+  No → Is it serving real-time requests?
+    Yes → CPU throttled, min-instances=1 (for cold start SLA)
+    No → CPU always-allocated (background service)
+```
+
+**Cold starts:** ~250-500ms for Go/Node.js, ~1-3s for JVM.
+Provisioned concurrency eliminates cold starts but costs the same
+as always-allocated. Use ARM (`--cpu-architecture=arm64`)
+where possible -- same price, ~20% lower latency for most
+workloads.
+
+### Vertex AI cost model
+
+Vertex AI has three cost-relevant deployment patterns:
+
+**1. Shared Endpoint (Prediction API, no dedicated nodes):**
+- Billed per request by model and input/output tokens
+- Scales to zero; no idle cost
+- Best for: intermittent inference, < 100 QPS
+- ~10-100x cheaper than dedicated endpoints for low traffic
+
+**2. Dedicated Endpoint (model deployed to endpoint with nodes):**
+- Billed per node-hour of the underlying accelerator
+- Always-on even at 0 QPS
+- Best for: high-throughput inference requiring low latency SLA
+- Use autoscaling with `minReplicaCount=0` to scale-to-zero during
+  off-hours (accept cold-start latency on first request)
+
+**3. Vertex AI Training (Custom Jobs):**
+- Billed per accelerator-hour for the job duration
+- Checkpointing is mandatory for any training > 2 hours;
+  use `Spot` machines for a 60-70% discount
+
+**TPU vs GPU pricing decision:**
+
+| Scenario | Recommendation |
+|---|---|
+| PyTorch workloads | A100 / H100 GPU nodes |
+| JAX / TensorFlow workloads | TPU v5e or v5p (better price/FLOP) |
+| LLM inference (< 30B params) | L4 GPU (best $/throughput at mid-scale) |
+| LLM training (> 10B params) | TPU v5p pods (purpose-built for scale) |
+
+**Vertex AI Workbench (notebooks) cost trap:**
+
+Workbench instances charge by the hour even when idle. A
+`n1-standard-4` instance left running costs ~$200/month.
+
+Enforce auto-shutdown:
+
+```bash
+gcloud workbench instances update MY-INSTANCE \
+  --location=us-central1-a \
+  --idle-shutdown-timeout=60m \
+  --idle-shutdown=true
+```
+
+Add this to the Terraform provisioning module for all Workbench
+instances. It is not enabled by default.
+
+**Managed vs self-managed Vertex AI TCO:**
+
+Vertex AI adds ~20-40% over raw Compute Engine for managed training
+and prediction. The premium buys: managed container registry,
+automatic model versioning, A/B deployment, pipeline orchestration.
+For teams with ML platform maturity, the managed-service markup is
+worth it. For teams running a single model in production, evaluate
+Cloud Run + custom inference server (TorchServe, vLLM, Triton) as
+a cheaper alternative.
+
 ## Anti-patterns
 
 - **Lambda for steady high-throughput APIs.** Containers usually win.

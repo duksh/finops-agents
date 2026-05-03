@@ -194,6 +194,218 @@ def detect(segment_history: list[float], threshold: float = 3.0) -> dict | None:
 | **Speed** | Better alerts reduce time-to-detection-of-real-problems |
 | **Quality** | Fewer false positives = trust = action |
 
+## Azure Budget & Alert Deep-Dive
+
+### Azure Budgets API
+
+Azure budgets are managed via the Cost Management REST API and can be
+scoped to **Management Groups**, **Subscriptions**, or **Resource Groups**.
+Unlike AWS (account-scoped) or GCP (billing-account or project-scoped),
+Azure budgets support Resource Group scope — enabling per-team, per-application
+budget enforcement without requiring separate subscriptions.
+
+```bash
+# Create a subscription-level budget with forecast-based alert
+az consumption budget create \
+  --budget-name "platform-team-monthly" \
+  --amount 10000 \
+  --time-grain "Monthly" \
+  --start-date "2025-01-01" \
+  --end-date "2026-01-01" \
+  --scope "/subscriptions/MY-SUB-ID" \
+  --threshold 90 \
+  --threshold-type "Forecasted" \
+  --contact-emails "finops-team@example.com" \
+  --contact-roles "Owner"
+```
+
+Key parameters:
+- `--threshold-type "Forecasted"` creates a trajectory alert (fires when
+  Azure forecasts you'll hit the threshold, not when you've already spent it)
+- `--threshold-type "Actual"` creates a static threshold alert (fires when
+  current spend crosses the percentage)
+- Use both: one `Forecasted` at 100% for early warning, one `Actual` at 80%
+  and 100% for confirmation
+
+**Action Groups for notifications (beyond email):**
+
+Azure Budgets integrate with Action Groups, enabling Webhook, Logic App,
+Automation Runbook, and Azure Function notifications. Wire budget alerts to
+a Slack channel via Logic App or a webhook to your incident management tool:
+
+```bash
+# Create an Action Group with Slack webhook
+az monitor action-group create \
+  --name "finops-alerts" \
+  --resource-group "monitoring-rg" \
+  --short-name "finops" \
+  --webhook-receiver name="slack" \
+  uri="https://hooks.slack.com/services/..."
+```
+
+Then reference the Action Group in the budget `--contact-groups` parameter.
+
+**Scoping strategy:**
+
+- **Management Group scope:** use for org-wide cost governance (requires
+  Cost Management Reader at MG level)
+- **Subscription scope:** default for team/product budgets when subscriptions
+  map to teams
+- **Resource Group scope:** use when multiple teams share a subscription;
+  maps directly to FOCUS `SubAccountId` + resource group filter
+
+### Azure Cost Anomaly Detection (Defender for Cloud)
+
+Azure's native anomaly detection in Cost Management is available in the
+Azure Portal as "Cost Anomaly Alerts" (preview in some tenants):
+
+```bash
+# Enable anomaly alerts (requires Cost Management Contributor)
+az costmanagement alert create \
+  --scope "/subscriptions/MY-SUB-ID" \
+  --name "anomaly-alert" \
+  --definition-type "Budget" \
+  --threshold 0
+```
+
+For programmatic anomaly detection, use the Cost Management query API
+to pull daily `EffectiveCost` per service and run the same STL/z-score
+detector as described in the main workflow above. Group by
+`ServiceName` × `SubscriptionId` × `ResourceGroup` for actionable
+segmentation.
+
+**Tag inheritance caveat for Azure alerts:** Azure tags don't propagate
+to child resources automatically. A subscription-level budget with a tag
+filter will miss costs on resources that weren't explicitly tagged.
+Set Azure Policy to enforce tag inheritance before building
+tag-filtered budgets — otherwise the budget scope is silently incomplete.
+
+## GCP Budget & Alert Deep-Dive
+
+### Cloud Billing Budgets API
+
+GCP budgets are managed via `billingbudgets.googleapis.com` and can be
+scoped to a **billing account** or filtered to specific **projects**,
+**services**, or **labels**. Unlike AWS budgets (account-scoped only),
+GCP budgets can filter down to a single label value, enabling per-team
+or per-product budget enforcement without separate billing accounts.
+
+```python
+from google.cloud import billing_budgets_v1
+
+client = billing_budgets_v1.BudgetServiceClient()
+budget = billing_budgets_v1.Budget(
+    display_name="team-platform-monthly",
+    budget_filter=billing_budgets_v1.Filter(
+        projects=["projects/my-project-id"],
+        services=["services/6F81-5844-456A"],  # Compute Engine
+        credit_types_treatment=(
+            billing_budgets_v1.Filter.CreditTypesTreatment
+            .EXCLUDE_ALL_CREDITS
+        ),
+    ),
+    amount=billing_budgets_v1.BudgetAmount(
+        specified_amount={"currency_code": "USD", "units": 5000}
+    ),
+    threshold_rules=[
+        billing_budgets_v1.ThresholdRule(threshold_percent=0.5),
+        billing_budgets_v1.ThresholdRule(threshold_percent=0.9),
+        billing_budgets_v1.ThresholdRule(
+            threshold_percent=1.0,
+            spend_basis=billing_budgets_v1.ThresholdRule.Basis.FORECASTED_SPEND,
+        ),
+    ],
+    notifications_rule=billing_budgets_v1.NotificationsRule(
+        pubsub_topic="projects/my-project/topics/billing-alerts",
+        schema_version="1.0",
+    ),
+)
+```
+
+**`thresholdRules` key decision:** use `FORECASTED_SPEND` basis on
+the 1.0 threshold rule (trajectory alert) rather than only
+`CURRENT_SPEND` (static threshold). This is the GCP equivalent of
+the "alert on trajectory" rule.
+
+**`allUpdatesRule` vs `thresholdRules`:** `allUpdatesRule` fires a
+Pub/Sub message on every budget update (noisy for programmatic
+consumption). Use `thresholdRules` for human-facing alerts; use
+`allUpdatesRule` only when you need a budget-event stream for
+automation (e.g., auto-disabling a project billing link).
+
+**Credit treatment:** `EXCLUDE_ALL_CREDITS` gives you unblended
+cost vs budget; `INCLUDE_ALL_CREDITS` includes SUDs and CUDs in
+the comparison. For engineering teams tracking net spend, include
+credits. For Finance comparing to PO commitments, exclude.
+
+### Cloud Monitoring Spend Alerts
+
+For per-service anomaly detection beyond budget thresholds:
+
+```yaml
+# Alert on GCS spend spike >2x 7-day average
+combiner: OR
+conditions:
+  - displayName: GCS monthly spend spike
+    conditionThreshold:
+      filter: >
+        resource.type="global"
+        metric.type="billing.googleapis.com/billing/monthly_cost"
+        metric.labels.service_description="Cloud Storage"
+      comparison: COMPARISON_GT
+      thresholdValue: 500   # USD
+      duration: 0s
+      aggregations:
+        - alignmentPeriod: 86400s
+          perSeriesAligner: ALIGN_MAX
+```
+
+`billing.googleapis.com/billing/monthly_cost` gives month-to-date
+spend per service; combine with a rolling baseline from BigQuery
+for z-score anomaly detection.
+
+### Quota Alerts
+
+GCP quota exhaustion causes workloads to fail silently (API 429s)
+which manifests as cost spikes when retry logic goes haywire. Wire
+quota utilization alerts via Cloud Monitoring:
+
+```yaml
+metric.type="serviceruntime.googleapis.com/quota/exceeded"
+resource.labels.service="compute.googleapis.com"
+```
+
+Alert at 80% quota utilization before exhaustion hits. Quota
+increases take 2-5 business days; blind spots here are expensive.
+
+### BigQuery ML Anomaly Detection (Run-tier)
+
+For organizations with BigQuery as their cost warehouse, ARIMA_PLUS
+is the lowest-effort path to seasonal anomaly detection:
+
+```sql
+-- Train a model per service per project
+CREATE OR REPLACE MODEL `my_project.cost_models.bq_arima`
+OPTIONS(
+  model_type = 'ARIMA_PLUS',
+  time_series_timestamp_col = 'usage_date',
+  time_series_data_col = 'daily_cost',
+  time_series_id_col = 'service_id',
+  auto_arima = TRUE,
+  data_frequency = 'DAILY',
+  holiday_region = 'US'
+) AS
+SELECT DATE(usage_start_time) AS usage_date,
+       service.id AS service_id,
+       SUM(cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)) AS daily_cost
+FROM `my_project.my_dataset.gcp_billing_export_resource_v1_*`
+WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+GROUP BY 1, 2;
+```
+
+Run `ML.DETECT_ANOMALIES` daily against the trained model; route
+results to Pub/Sub or directly to PagerDuty via Cloud Functions.
+
 ## FinOps Framework Anchors
 
 **Domain:** Quantify Business Value (Budgeting) + Understand Usage &

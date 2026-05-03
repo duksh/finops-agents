@@ -9,7 +9,7 @@ GPTs, Claude Projects, and Gemini Gems on the web.
 Built by [Cletrics](https://realtimecost.com) and the FinOps community.
 MIT-licensed. Vendor-neutral where possible. Contributions welcome.
 
-**Framework-aligned. 22 of 22 Capabilities covered (100%).** Every
+**Framework-aligned. 22 of 22 Capabilities covered (100%), 26 agents.** Every
 agent carries explicit
 [FinOps Framework](https://www.finops.org/framework/) metadata -- Domain,
 Capability, Phase, Personas, Maturity entry point -- and references a
@@ -77,14 +77,16 @@ directory. No network calls, no sudo, no elevated privileges.
 
 ---
 
-## Agent roster (24 agents, 7 categories)
+## Agent roster (26 agents, 7 categories)
 
 > **v2 consolidation note.** The roster was consolidated from 43 agents
 > in v1 to 24 in v2 by merging provider-specific variants behind
 > FOCUS-shaped capability agents. v1 agents (e.g. `AWS Cost Explorer
 > Analyst`, `GCP Billing Interpreter`) are now covered as
 > provider-native deep-cuts inside the consolidated agents
-> (e.g. `Cloud Billing Analyst`). If you previously installed v1, see
+> (e.g. `Cloud Billing Analyst`). Two additional GCP-specialized agents
+> (BigQuery Cost Optimizer, Cloud SQL Cost Optimizer) were added in the
+> GCP enhancement pass. If you previously installed v1, see
 > the migration table at the bottom of this section.
 
 ### `cloud-cost/` -- 5 agents
@@ -114,14 +116,19 @@ Rate optimization across all clouds.
 - **EDP Negotiation Coach** -- private pricing prep, BATNA modeling,
   non-price terms
 
-### `data-platforms/` -- 2 agents
+### `data-platforms/` -- 3 agents
 The pipelines and models behind every cost dashboard.
 
 - **FOCUS Data Engineer** -- ingest, transform, and validate
   FOCUS-conformant cost datasets across providers; runs the FOCUS
-  Validator and Requirements Analyzer
+  Validator and Requirements Analyzer; includes a full GCP FOCUS
+  pipeline section with BigQuery export → FOCUS column mapping,
+  credit restatement handling, and tags normalization
 - **Cost Warehouse Modeler** -- dimensional models with FOCUS as the
   conformed-dimension source of truth; dbt, semantic layer
+- **BigQuery Cost Optimizer** *(GCP)* -- on-demand vs capacity slot
+  pricing decisions, partition/clustering strategy, INFORMATION_SCHEMA
+  query audits, slot commitment sizing, BI Engine ROI analysis
 
 ### `governance/` -- 7 agents
 Practice operations: showback, chargeback, tagging, maturity, policy,
@@ -155,22 +162,31 @@ Container-level attribution and in-cluster optimization.
 The hunters.
 
 - **Idle & Orphaned Resource Hunter** -- compute, snapshots, load
-  balancers, and zombie NAT Gateways in one inventory
+  balancers, and zombie NAT Gateways in one inventory; includes GCP
+  idle detection patterns (Compute Engine, Cloud SQL, static IPs,
+  orphaned persistent disks)
 - **Cross-AZ Egress Investigator** -- network cost hidden across
   storage / database / managed-service categories
-- **S3 Storage Class Auditor** -- object-storage class alignment +
-  lifecycle policies
+- **Object Storage Class Auditor** *(renamed from S3 Storage Class Auditor)* --
+  object-storage class alignment + lifecycle policies across S3, GCS
+  (Nearline/Coldline/Archive/Autoclass), and Azure Blob
 
-### `specialized/` -- 3 agents
+### `specialized/` -- 4 agents
 Higher-leverage niches.
 
 - **Workload Cost Optimizer** -- ML training/inference + serverless
-  + spot strategies (compute-pattern specialist)
+  + spot strategies (compute-pattern specialist); includes GCP Cloud
+  Run CPU allocation model, min-instances cost traps, Vertex AI
+  dedicated vs shared endpoint pricing, TPU vs GPU selection
 - **License & SaaS Cost Optimizer** -- BYOL, marketplace, entitlement
   audits, FOCUS Provider/Publisher/Invoice Issuer for marketplace
   attribution
 - **Cloud Sustainability Analyst** -- carbon accounting, region-carbon
   trade-offs, demand shifting
+- **Cloud SQL Cost Optimizer** *(GCP)* -- right-sizing Cloud SQL
+  instances (PostgreSQL/MySQL/SQL Server), HA configuration audits,
+  idle instance detection, read replica audits, CUD analysis, and
+  AlloyDB migration evaluation
 
 ### v1 → v2 migration map
 
@@ -209,16 +225,22 @@ Higher-leverage niches.
 
 ---
 
-## Playbooks (10 named patterns)
+## Playbooks (14 named patterns)
 
 Named-pattern writeups for specific failure modes. Cite them by name.
 
-**Cloud resource waste:**
+**Cloud resource waste (AWS):**
 - [Zombie NAT Gateway](./playbooks/zombie-nat-gateway.md)
 - [Snapshot Sprawl](./playbooks/snapshot-sprawl.md)
 - [Cross-AZ Chatterbox](./playbooks/cross-az-chatterbox.md)
 - [Idle Load Balancer](./playbooks/idle-load-balancer.md)
 - [Oversized RDS](./playbooks/oversized-rds.md)
+
+**Cloud resource waste (GCP):**
+- [Cloud SQL HA in Dev](./playbooks/cloud-sql-ha-in-dev.md) -- HA enabled on non-production databases, silently doubling instance cost
+- [GCS Multi-Region Sprawl](./playbooks/gcs-multi-region-sprawl.md) -- buckets in multi-region/dual-region when single-region meets the requirement
+- [BigQuery SELECT * Drift](./playbooks/bigquery-select-star-drift.md) -- unpartitioned full-table scans from dashboards and ad-hoc queries
+- [GKE Autopilot Request Bloat](./playbooks/gke-autopilot-request-bloat.md) -- production-sized pod requests copied into dev/staging Autopilot clusters
 
 **Reporting / allocation / governance patterns (FCP-anchored):**
 - [Untagged Spend Drift](./playbooks/untagged-spend-drift.md)
@@ -247,6 +269,204 @@ Reference the Budget & Anomaly Operator rule to design our alerting pipeline.
 **Any tool**
 Reference the agent by name in a conversation. The agent's persona and rules
 become the working context for that task.
+
+---
+
+## GCP usage examples and expected results
+
+The following examples show prompts and the kind of output you should
+expect when using the GCP-enhanced agents with a GCP-focused billing
+dataset.
+
+### 1. Diagnose a GCP billing spike
+
+**Agent:** Cloud Billing Analyst
+
+**Prompt:**
+```text
+Our GCP bill jumped $12k month-over-month. The BigQuery billing export
+is in `my-project.billing.gcp_billing_export_resource_v1_*`.
+Identify the top movers and explain the credit handling.
+```
+
+**Expected output:**
+- FOCUS SQL query against the BigQuery export using the correct
+  `cost + SUM(credits[].amount)` pattern for EffectiveCost
+- Breakout by `service.description` and `project.id` showing top
+  movers week-over-week
+- Identification of any `cost_type = 'adjustment'` rows (corrections)
+  that should be excluded from trend
+- Explicit note on which credits (`SUD`, `CUD`, `PROMOTION`) are
+  included in the net cost number and whether SUDs are masking the
+  true usage spike
+
+---
+
+### 2. Set up GCP budget alerts that actually fire
+
+**Agent:** Budget & Anomaly Operator
+
+**Prompt:**
+```text
+We have 8 GCP projects under billing account XXXXXX-YYYYYY-ZZZZZZ.
+Set up project-level budget alerts using the Cloud Billing Budgets API.
+We want trajectory alerts, not just threshold alerts.
+```
+
+**Expected output:**
+- Python code using `google.cloud.billing_budgets_v1` with
+  `thresholdRules` including a `FORECASTED_SPEND` basis rule at 100%
+- Pub/Sub notification channel configuration
+- Guidance on `credit_types_treatment` choice (include vs exclude)
+  and how it affects the trajectory number Finance sees
+- Warning about `allUpdatesRule` noisiness vs targeted `thresholdRules`
+
+---
+
+### 3. Right-size Cloud SQL instances
+
+**Agent:** Cloud SQL Cost Optimizer
+
+**Prompt:**
+```text
+We have 14 Cloud SQL instances in us-central1. I suspect we're
+over-paying on HA configuration and oversized tiers. Run a cost audit.
+```
+
+**Expected output:**
+- `gcloud sql instances list` command to enumerate instances and
+  their `availabilityType`
+- Cloud Monitoring metric queries for `database/cpu/utilization` and
+  `database/memory/utilization` over 14 days
+- Table showing each instance: current tier, HA status, p95 CPU/RAM,
+  recommended tier, monthly savings from right-sizing
+- List of dev/staging instances with HA enabled and estimated monthly
+  waste per instance (typically $168-$400/instance depending on tier)
+- CUD break-even calculation for the production fleet
+
+---
+
+### 4. Optimize GKE cluster costs
+
+**Agent:** Kubernetes FinOps Engineer
+
+**Prompt:**
+```text
+We run GKE Standard clusters. We're seeing high idle node cost.
+Should we migrate to Autopilot? What changes to our workloads would
+be required?
+```
+
+**Expected output:**
+- Side-by-side billing model comparison: Standard (per node-hour) vs
+  Autopilot (per pod resource request) with break-even analysis
+- Identification of workloads that would cost more on Autopilot
+  (over-requested pods that don't consume their requests) vs less
+  (workloads currently running on mostly-idle nodes)
+- GKE Cost Allocation feature setup instructions to quantify per-namespace
+  spend before migration
+- NEG load balancer annotation recommendation to reduce LCU charges
+- Specific `scheduling.gke.io/gke-spot: "true"` approach for Autopilot
+  Spot vs Standard Spot node pools
+
+---
+
+### 5. Reduce BigQuery query costs
+
+**Agent:** BigQuery Cost Optimizer
+
+**Prompt:**
+```text
+Our BigQuery on-demand bill is $8,000/month. What are the top
+optimization opportunities?
+```
+
+**Expected output:**
+- `INFORMATION_SCHEMA.JOBS_BY_PROJECT` query to identify top 10
+  most expensive queries by TB billed in the last 30 days
+- Partition pruning audit: for each expensive query, check whether
+  the `WHERE` clause filters on the partition column
+- `TABLE_STORAGE` query identifying tables with high active storage
+  and zero recent reads (candidates for deletion or archival)
+- Break-even analysis: at $8k/month, capacity pricing (slots) is
+  competitive -- model the break-even point with flex + monthly
+  commitment layering
+- `require_partition_filter = true` recommendation for the top 3
+  scanned tables
+- BI Engine sizing recommendation for dashboard queries (expected
+  to eliminate 30-50% of scan cost)
+
+---
+
+### 6. Audit GCS storage classes
+
+**Agent:** Object Storage Class Auditor
+
+**Prompt:**
+```text
+We have 200 TB in GCS buckets. Most were created with Standard storage.
+Audit and recommend lifecycle policies.
+```
+
+**Expected output:**
+- `gcloud storage buckets list` command to find buckets by location
+  type (flag multi-region buckets as 2x premium candidates)
+- GCS lifecycle policy JSON for Standard → Nearline (30 days) →
+  Coldline (90 days) → Archive (365 days) transition chain
+- Autoclass vs manual lifecycle policy recommendation: for buckets
+  with mixed access patterns, Autoclass; for uniformly cold data,
+  direct lifecycle rule to Coldline/Archive is cheaper
+- Versioning + missing `noncurrentVersionExpiration` audit with
+  example of the bound-growing cost trap
+- Minimum storage duration penalty warning for premature transitions
+
+---
+
+### 7. Enforce GCP label policy at project creation
+
+**Agent:** Allocation & Policy Architect
+
+**Prompt:**
+```text
+40% of our GCP spend is untagged. We need to enforce labels at
+resource creation, not after-the-fact. Explain the GCP approach.
+```
+
+**Expected output:**
+- Organization Policy custom constraint YAML enforcing required labels
+  (`env`, `team`, `cost-center`) at resource creation time
+- Explanation of GCP label inheritance gap: labels do NOT flow from
+  folders to projects -- enforcement must be at each resource level
+- `gcloud billing projects describe` audit command to find projects
+  with no labels on any resources
+- Cloud Asset Inventory pattern to build a `dim_project_hierarchy`
+  table mapping `project.id` to folder chain for allocation roll-up
+- Warning about Shared VPC host-project billing attribution and how
+  to split networking costs across service projects
+
+---
+
+### 8. Onboard a new GCP project with cost controls from day zero
+
+**Agent:** Cloud Onboarding Coordinator
+
+**Prompt:**
+```text
+We're launching a new GCP project for the payments team next week.
+What needs to be in place before it goes live?
+```
+
+**Expected output:**
+- Billing account linkage verification (`gcloud billing projects link`)
+- Mandatory label Organization Policy custom constraint deployment
+- Budget creation via Cloud Billing Budgets API with trajectory alert
+  wired to Pub/Sub
+- Detailed billing export to BigQuery enabled (with note: not
+  retroactive, must be enabled before first charge)
+- Service account convention (no default compute service account in
+  production; dedicated SA per workload with `team` label)
+- FOCUS pipeline check: is the new project's billing account already
+  covered by the existing BigQuery export dataset?
 
 ---
 

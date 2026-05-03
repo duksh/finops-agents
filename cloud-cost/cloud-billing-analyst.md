@@ -178,6 +178,81 @@ Use these only when FOCUS doesn't yet expose what you need.
 - Use management groups for cost roll-up, not just subscriptions
 - Azure Hybrid Benefit eligibility audits are often large and ignored
 
+### Azure Billing Deep-Dive
+
+**Agreement types and their export shapes:**
+
+| Agreement | Export API | Key difference |
+|---|---|---|
+| EA (Enterprise Agreement) | `/providers/Microsoft.Billing/billingAccounts/{id}/providers/Microsoft.CostManagement/exports` | `BillingAccountId` is the enrollment number |
+| MCA (Microsoft Customer Agreement) | Same endpoint, different scope | `BillingProfileId` is the invoice section; `InvoiceSection` maps to FOCUS `SubAccountId` |
+| CSP (Cloud Solution Provider) | Partner Center API | Reseller-specific; `CustomerTenantId` is the end customer |
+| PAYG | Azure Portal export only | No EA-style API; use Cost Management REST API |
+
+**Always verify the agreement type before writing any query.** Column
+names and hierarchy differ: EA uses `BillingAccountName` →
+`DepartmentName` → `AccountName` → `SubscriptionName`; MCA uses
+`BillingAccountName` → `BillingProfileName` → `InvoiceSectionName` →
+`SubscriptionName`. FOCUS normalizes these, but provider-native queries break.
+
+**Key native cost export columns → FOCUS mapping:**
+
+| Azure native column | FOCUS column | Notes |
+|---|---|---|
+| `SubscriptionId` | `SubAccountId` | Stable; use as join key |
+| `SubscriptionName` | `SubAccountName` | Mutable |
+| `ResourceGroup` | (no direct FOCUS equivalent) | Use as allocation dimension via `Tags` or external mapping |
+| `ResourceId` | `ResourceId` | Full ARM resource ID |
+| `ServiceName` | `ServiceName` | E.g., "Virtual Machines" |
+| `MeterCategory` | `ServiceCategory` approximation | More granular than FOCUS category |
+| `ChargeType` | `ChargeCategory` | `Usage` → `Usage`; `Purchase` → `Purchase`; `Refund` → `Adjustment` |
+| `UnitPrice` | `ContractedUnitPrice` | Pre-discount unit price |
+| `EffectivePrice` | (maps to) `EffectiveCost` / `ConsumedQuantity` | Post-commitment amortized rate |
+| `Tags` | `Tags` | JSON in both; Azure tags need policy enforcement to propagate |
+| `PayGPrice` | `ListUnitPrice` | Public on-demand rate |
+
+**Actual vs amortized export — critical distinction:**
+
+- **Actual export:** Reservation purchases appear as a lump sum in the
+  purchase month. `ChargeType='Purchase'`. Finance uses this for invoice
+  reconciliation.
+- **Amortized export:** Reservation cost is spread across the reservation
+  term. `ChargeType='Usage'` with `PricingModel='Reservation'`. Use this
+  for trend analysis and chargeback.
+- **FOCUS export (preferred):** Emits both `BilledCost` (actual) and
+  `EffectiveCost` (amortized) in the same row. No need to choose.
+
+**Azure FOCUS export setup:**
+
+```bash
+# Create a scheduled export to a storage account
+az costmanagement export create \
+  --name "focus-daily-export" \
+  --scope "/subscriptions/MY-SUB-ID" \
+  --storage-account-id "/subscriptions/.../storageAccounts/MY-SA" \
+  --storage-container "focus-exports" \
+  --storage-directory "focus" \
+  --type "FocusCost" \
+  --schedule-recurrence "Daily" \
+  --schedule-recurrence-period start="2025-01-01" end="2026-01-01" \
+  --time-frame "MonthToDate"
+```
+
+**Azure Hybrid Benefit audit query (Cost Management API):**
+
+AHB converts Windows Server and SQL Server VMs from pay-as-you-go
+licensing to Bring-Your-Own-License, typically saving 20-40% on those
+VM costs. It is frequently unclaimed because it requires opting in:
+
+```bash
+# Find VMs not using AHB (Windows VMs with standard OS cost)
+az vm list --query "[?storageProfile.osDisk.osType=='Windows' && licenseType!='Windows_Server'].{Name:name, ResourceGroup:resourceGroup, LicenseType:licenseType}" -o table
+```
+
+AHB is also available for SQL Server VMs, AKS Windows node pools,
+and Azure SQL Database. Run the eligibility audit before any Azure
+commitment purchase — AHB changes the effective discount math completely.
+
 ### GCP
 
 - Use the **detailed** billing export, not the standard one --
@@ -189,6 +264,85 @@ Use these only when FOCUS doesn't yet expose what you need.
 - Per-second billing means stop/start frequently is fine on GCE
 - GCP uses **labels** (case-sensitive); FOCUS surfaces them in `Tags`
   with provider tag prefixes
+
+### GCP Billing Deep-Dive
+
+**Detailed billing export schema (BigQuery)**
+
+Key columns in `gcp_billing_export_resource_v1_*`:
+
+| Native column | FOCUS mapping | Notes |
+|---|---|---|
+| `billing_account_id` | `BillingAccountId` | Stable ID, not display name |
+| `project.id` | `SubAccountId` | Use `project.id`, not `project.name` (mutable) |
+| `service.description` | `ServiceName` | Human-readable; prefer `service.id` in joins |
+| `sku.description` | `SkuDescription` | Very verbose; normalize via `service.id` + `sku.id` |
+| `usage_start_time` | `ChargePeriodStart` | Per-second granularity for Compute |
+| `cost` | base before credits | Sum with `credits[].amount` to get net cost |
+| `cost_type` | `ChargeClass` | See mapping below |
+| `labels` | `Tags` | Array of `{key, value}`; flatten before joining |
+
+**`cost_type` → FOCUS `ChargeClass` mapping:**
+
+- `regular` → `ChargeClass IS NULL` (normal consumption)
+- `tax` → `ChargeClass='Tax'`
+- `adjustment` → `ChargeClass='Correction'`
+- `rounding_error` → `ChargeClass='Correction'`
+
+**Credit handling — critical for correct Effective Cost:**
+
+GCP emits credits as an array `credits[]` on each row, not as
+separate rows. Each credit has a `type`:
+
+- `COMMITTED_USAGE_DISCOUNT` — CUD applied; maps to
+  `PricingCategory='Committed'`
+- `COMMITTED_USAGE_DISCOUNT_DOLLAR_BASE` — spend-based CUD
+- `SUSTAINED_USE_DISCOUNT` — auto-applied SUD; no FOCUS
+  `CommitmentDiscountId` (not a user commitment)
+- `PROMOTION` — promotional credits; treat as `ChargeClass='Correction'`
+  in trend analysis
+- `FREE_TIER` — maps to `PricingCategory='Free'`
+
+**GCP amends historical billing data.** Unlike AWS CUR, GCP can
+re-emit rows for past months when SUDs or CUDs are recalculated.
+Pipelines must `MERGE` on natural keys, not `INSERT`. The natural
+key in the BigQuery export is `(billing_account_id, project.id,
+service.id, sku.id, usage_start_time, labels_hash, cost_type)`.
+See [`focus-data-engineer.md`](../data-platforms/focus-data-engineer.md)
+for the pipeline pattern.
+
+**Cloud Billing API v1 (programmatic access):**
+
+```python
+# List all projects under a billing account
+from googleapiclient.discovery import build
+
+billing = build('cloudbilling', 'v1')
+result = billing.billingAccounts().projects().list(
+    name='billingAccounts/XXXXXX-YYYYYY-ZZZZZZ'
+).execute()
+```
+
+Use this to audit which projects are linked to which billing
+accounts -- essential for multi-org or reseller structures.
+
+**Carbon Footprint API:**
+
+Available via `cloudsustainability.googleapis.com`; returns
+carbon footprint data by project, service, and region. Feed it
+into the sustainability analyst workflow for GCP-specific
+carbon-aware billing breakdowns.
+
+**Cloud SQL billing nuances:**
+
+Cloud SQL bills vCPU and RAM as separate line items from storage.
+High Availability (HA) doubles the instance cost (vCPU + RAM only,
+not storage). Read replicas are full instance cost. Always
+separate `cloudsql.googleapis.com` into `instance`, `storage`,
+and `backup` SKUs when attributing to teams -- the ratios vary
+dramatically by workload. See the dedicated Cloud SQL agent
+(`specialized/cloud-sql-cost-optimizer.md`) for right-sizing
+and HA audit workflows.
 
 ### OCI
 

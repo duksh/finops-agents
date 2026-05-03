@@ -74,6 +74,103 @@ estate with full cost transparency from day zero.
 - 90-day post-migration review template
 - Acquired-organization integration playbook
 
+## GCP Onboarding Gate
+
+GCP project onboarding has structural differences from AWS account
+or Azure subscription onboarding. The following gate items are
+GCP-specific and must be added to the standard onboarding checklist
+when the destination is GCP.
+
+### Billing account structure
+
+**Decision required at onboarding:** which billing account does this
+project link to?
+
+- **Single billing account** (most organizations): all projects
+  share one billing account; cost separation is by project and label
+- **Multiple billing accounts**: typically for BU chargeback,
+  acquisition integration, or reseller/MSP structures
+- **Sub-accounts (billing sub-accounts)**: for Google resellers and
+  MSPs only; not a standard enterprise pattern. If the org uses a
+  reseller, confirm which sub-account the project should link to
+  before go-live.
+
+```bash
+# Link the new project to the correct billing account at project creation
+gcloud billing projects link MY-NEW-PROJECT \
+  --billing-account=XXXXXX-YYYYYY-ZZZZZZ
+```
+
+**Never launch a project without confirming billing linkage.**
+Projects with billing disabled incur no charges but also provide
+no cost visibility -- a silent black box.
+
+### Mandatory label policy at project creation
+
+Before the project goes live, attach an Organization Policy that
+enforces mandatory labels at resource creation time. This is the
+**only** cheap moment to do this -- retrospective label campaigns
+on live environments take 3-6 months.
+
+Minimum required labels at onboarding:
+
+| Label key | Example value | Purpose |
+|---|---|---|
+| `env` | `production` | Environment tier |
+| `team` | `platform-eng` | Owner for chargeback |
+| `cost-center` | `cc-1042` | Finance allocation key |
+| `product` | `checkout-service` | Product attribution |
+
+Verify the Organization Policy custom constraint exists and is set
+to `enforce: true` for the target folder **before** handing off the
+project to the engineering team.
+
+### Budget creation as a go-live gate
+
+A project must have a budget alert configured before it goes live.
+This is not optional. Use the Cloud Billing Budgets API (see
+`cloud-cost/budget-anomaly-operator.md`) to create a project-scoped
+budget as part of the automated provisioning workflow:
+
+```bash
+# Quick budget creation via gcloud (automate in Terraform/IaC)
+gcloud billing budgets create \
+  --billing-account=XXXXXX-YYYYYY-ZZZZZZ \
+  --display-name="my-new-project-monthly" \
+  --budget-amount=10000USD \
+  --threshold-rule=percent=0.5 \
+  --threshold-rule=percent=0.9 \
+  --threshold-rule=percent=1.0,basis=forecasted-spend \
+  --filter-projects=projects/my-new-project \
+  --all-updates-rule-pubsub-topic=projects/my-project/topics/billing-alerts
+```
+
+### Service account cost attribution convention
+
+GCP workloads run as service accounts. Label service accounts
+themselves and enforce that Compute Engine instances, GKE workloads,
+and Cloud Run services use a dedicated service account (not the
+default compute service account). The default compute service account
+is a common attribution black hole -- any workload that uses it
+appears as "unattributed compute" in team breakdowns.
+
+Policy: require `google_service_account` resources in Terraform to
+have `display_name` matching the owning team's convention; block use
+of the default compute service account in production via Organization
+Policy.
+
+### FOCUS export setup
+
+Stand up the detailed billing export to BigQuery for the new billing
+account before the project goes live. The export is not retroactive
+-- charges before export enablement are lost from the data warehouse.
+
+```bash
+gcloud billing accounts get-iam-policy XXXXXX-YYYYYY-ZZZZZZ
+# Then enable export via Console: Billing → Billing Export → BigQuery Export
+# Dataset must be in the same org as the billing account
+```
+
 ## Anti-patterns
 
 - **"We'll tag it later."** Later is 18 months and 25% untagged spend.

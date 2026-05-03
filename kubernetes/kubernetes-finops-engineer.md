@@ -67,6 +67,178 @@ for chargeback or showback.
 - Always show utilization alongside allocation -- cost without utilization is incomplete
 - Treat multi-tenant clusters as the rule, not the exception
 
+## AKS-Specific Cost Allocation
+
+### AKS Cost Analysis add-on
+
+Azure Kubernetes Service provides a native Cost Analysis add-on that
+surfaces per-namespace, per-workload, and per-node-pool cost breakdowns
+directly in the Azure Portal and via the Azure Cost Management API.
+
+```bash
+# Enable the Cost Analysis add-on on an existing AKS cluster
+az aks update \
+  --name MY-CLUSTER \
+  --resource-group MY-RG \
+  --enable-cost-analysis
+```
+
+Requirements:
+- AKS cluster version 1.29+
+- `Standard` or `Premium` tier (not Free)
+- All pods must have resource requests set (pods without requests show
+  as "unallocated")
+
+The add-on emits cost data to Azure Cost Management with the dimension
+`kubernetes namespace` and `kubernetes label` -- making per-namespace
+costs queryable via the standard Cost Management API and visible in
+the Azure Portal cost views.
+
+**Map AKS namespaces to FOCUS `Tags`:** AKS namespace labels are
+surfaced in the billing export as resource tags once the Cost Analysis
+add-on is enabled. The tag key is `kubernetes namespace`.
+
+### Azure CNI vs kubenet network cost
+
+AKS supports two CNI plugins with different cost profiles:
+
+- **kubenet:** Pods use a private IP range; only node IPs are on the
+  VNet. Network traffic between pods on different nodes traverses the
+  node's external IP, potentially crossing AZ boundaries and incurring
+  inter-AZ traffic charges.
+- **Azure CNI:** Each pod gets a VNet IP. Pod-to-pod traffic stays on the
+  VNet, reducing inter-AZ costs for dense pod communication.
+
+For clusters with high east-west pod traffic (microservices, service
+mesh), Azure CNI typically reduces networking cost. For clusters with
+low east-west traffic, kubenet is cheaper (fewer VNet IPs needed).
+
+### OpenCost on AKS
+
+OpenCost works on AKS with the Azure cloud cost integration. Configure
+the Azure cost provider to pull per-node-hour costs from the Azure
+Retail Prices API:
+
+```yaml
+# values.yaml for OpenCost helm chart on AKS
+opencost:
+  exporter:
+    cloudProviderApiKey: ""  # not used for Azure
+  prometheus:
+    external:
+      enabled: true
+      url: "http://prometheus-server.monitoring.svc.cluster.local"
+  ui:
+    enabled: true
+azure:
+  billingAccountId: "MY-BILLING-ACCOUNT-ID"
+  offerDurableId: "MS-AZR-0003P"  # PAYG; use MS-AZR-0017P for EA
+  currency: "USD"
+```
+
+OpenCost surfaces per-namespace and per-deployment cost aligned to
+FOCUS `ServiceCategory='Compute'` once connected to Azure billing.
+
+## GKE-Specific Cost Allocation
+
+### Autopilot vs Standard cost model
+
+**GKE Autopilot** and **GKE Standard** have fundamentally different
+billing models. Choosing the wrong one for a workload costs 30-60%
+more than necessary.
+
+| Dimension | Autopilot | Standard |
+|---|---|---|
+| Billing unit | Per Pod resource request | Per node-hour |
+| Node visibility | None (Google-managed) | Full |
+| Idle cost | Zero (no node cost when no pods) | Idle node-hours billed |
+| Bin-packing control | Automatic | Manual (Karpenter/CA) |
+| Spot support | `scheduling.gke.io/gke-spot: "true"` on pod | Node pool level |
+| Min resource per pod | CPU: 0.25 vCPU, Memory: 0.5 GB | None |
+
+**Autopilot billing formula:**
+
+```text
+cost = (pod_cpu_request × cpu_rate)
+     + (pod_memory_request × memory_rate)
+     + (pod_ephemeral_storage_request × storage_rate)
+```
+
+Requests are rounded up to the nearest Autopilot resource class
+(micro / small / medium / large / xlarge). A pod requesting 0.3
+vCPU bills at 0.5 vCPU. **Right-sizing requests is more important
+in Autopilot than in Standard** -- over-requested pods directly
+multiply cost with no offset from unused node headroom.
+
+**When Autopilot wins:** bursty workloads with irregular schedules,
+dev/staging environments, teams without Kubernetes expertise, any
+workload where idle-time cost is the dominant concern.
+
+**When Standard wins:** large steady-state workloads with predictable
+shape, ML training (GPU/TPU node pools), workloads needing custom
+kernel configuration, high-throughput networking requirements.
+
+### GKE Cost Allocation feature
+
+Enable cost allocation to surface per-namespace and per-label
+breakdowns in the GCP billing export:
+
+```bash
+gcloud container clusters update MY-CLUSTER \
+  --region=us-central1 \
+  --resource-usage-bigquery-dataset=my_billing_dataset \
+  --enable-network-egress-metering \
+  --enable-resource-consumption-metering
+```
+
+This requires:
+1. Namespaces have resource quotas set (LimitRanges alone are
+   insufficient)
+2. All pods have resource requests (no requests = no allocation)
+
+The output lands in BigQuery as
+`gke_cluster_resource_usage_*` tables, joinable to the billing
+export via `cluster_name` and `namespace`.
+
+Map these into FOCUS `Tags` via the FOCUS data engineer pipeline
+to make GKE namespace costs joinable to non-GKE costs in the
+warehouse.
+
+### Regional vs Zonal cluster cost
+
+**Regional clusters** (3-zone control plane) charge an additional
+control plane fee on top of the per-node cost. Zonal clusters have
+one control plane zone (no additional fee at Autopilot tier).
+
+For production workloads: pay the regional premium -- it's
+typically <5% of total cluster cost and buys multi-zone control
+plane availability.
+
+For dev/staging: use zonal clusters or Autopilot to avoid the
+regional premium while retaining workload isolation.
+
+### NEG load balancers vs classic LBs
+
+**Container-native load balancing via NEGs** (Network Endpoint
+Groups) routes traffic directly to pod IPs, eliminating the
+double-hop via `kube-proxy` (`NodePort`). This reduces:
+
+- Load balancer LCU charges (fewer health checks, more efficient
+  connection distribution)
+- Inter-VM network traffic cost (no `NodePort` fan-out)
+
+Enable NEGs by adding the `cloud.google.com/neg` annotation:
+
+```yaml
+metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+```
+
+The `BackendConfig` resource configures health checks and session
+affinity. For high-traffic services, NEG adoption typically
+reduces networking cost by 10-20%.
+
 ## FinOps Framework Anchors
 
 **Domain:** Understand Usage & Cost
