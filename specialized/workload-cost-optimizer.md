@@ -176,7 +176,7 @@ Azure Functions has three hosting plans with very different cost models:
 
 **Consumption plan cost formula:**
 
-```
+```text
 cost = (executions × $0.20/million)
      + (GB-seconds × $0.000016/GB-second)
 ```
@@ -269,7 +269,7 @@ cost profiles:
 
 **Cloud Run billing formula (throttled mode):**
 
-```
+```text
 cost = (CPU_vCPU × $0.00002400/vCPU-second)
      + (memory_GB × $0.00000250/GB-second)
      + (requests × $0.00000040 per request)
@@ -281,11 +281,15 @@ single always-on 1 vCPU / 512 MB Cloud Run service on always-allocated
 costs ~$15/month in idle. 20 services with `--min-instances=1` is
 ~$300/month in floor cost before a single request is processed.
 
-Audit: `gcloud run services list --format=json | jq '.[].spec.template.metadata.annotations."autoscaling.knative.dev/minScale"'` -- any non-zero value needs a business justification.
+Audit — any non-zero value needs a business justification:
+
+```bash
+gcloud run services list --format=json | jq '.[].spec.template.metadata.annotations."autoscaling.knative.dev/minScale"'
+```
 
 **Cloud Run cost decision tree:**
 
-```
+```text
 Is the workload bursty with variable traffic?
   Yes → CPU throttled, min-instances=0
   No → Is it serving real-time requests?

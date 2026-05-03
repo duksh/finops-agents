@@ -399,11 +399,40 @@ $18/month minimum waste.
 GCP persistent disk snapshots bill at ~$0.026/GB/month. Snapshots
 of deleted disks (no source disk) are almost always orphaned:
 
-```bash
-# Find snapshots whose source disk no longer exists
-gcloud compute snapshots list \
-  --format="table(name,sourceDisk,diskSizeGb,creationTimestamp,storageLocations)" \
-  | grep -v "https://"  # sourceDisk URL present means disk still exists
+```python
+# Find snapshots whose source disk no longer exists.
+# GCP retains the sourceDisk URL in snapshot metadata even after disk deletion,
+# so filtering on URL presence is unreliable. Verify each disk via the API.
+import subprocess, json
+
+result = subprocess.run(
+    ["gcloud", "compute", "snapshots", "list",
+     "--format=json(name,sourceDisk,diskSizeGb,creationTimestamp)"],
+    capture_output=True, text=True
+)
+snapshots = json.loads(result.stdout)
+
+for snap in snapshots:
+    source = snap.get("sourceDisk", "")
+    if not source:
+        print(f"ORPHANED (no sourceDisk): {snap['name']}  {snap['diskSizeGb']} GB")
+        continue
+    # URL format: .../projects/{proj}/zones/{zone}/disks/{disk}
+    parts = source.rstrip("/").split("/")
+    try:
+        proj = parts[parts.index("projects") + 1]
+        zone = parts[parts.index("zones") + 1]
+        disk = parts[parts.index("disks") + 1]
+    except (ValueError, IndexError):
+        print(f"UNKNOWN (parse error): {snap['name']}")
+        continue
+    check = subprocess.run(
+        ["gcloud", "compute", "disks", "describe", disk,
+         f"--project={proj}", f"--zone={zone}", "--format=value(name)"],
+        capture_output=True, text=True
+    )
+    if check.returncode != 0 and "was not found" in check.stderr:
+        print(f"ORPHANED: {snap['name']}  {snap['diskSizeGb']} GB  (disk {disk} deleted)")
 ```
 
 Apply the Joe Daly tag-and-notify pattern: tag orphaned snapshots

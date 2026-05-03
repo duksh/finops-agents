@@ -283,7 +283,7 @@ dataset.
 **Agent:** Cloud Billing Analyst
 
 **Prompt:**
-```
+```text
 Our GCP bill jumped $12k month-over-month. The BigQuery billing export
 is in `my-project.billing.gcp_billing_export_resource_v1_*`.
 Identify the top movers and explain the credit handling.
@@ -307,7 +307,7 @@ Identify the top movers and explain the credit handling.
 **Agent:** Budget & Anomaly Operator
 
 **Prompt:**
-```
+```text
 We have 8 GCP projects under billing account XXXXXX-YYYYYY-ZZZZZZ.
 Set up project-level budget alerts using the Cloud Billing Budgets API.
 We want trajectory alerts, not just threshold alerts.
@@ -328,7 +328,7 @@ We want trajectory alerts, not just threshold alerts.
 **Agent:** Cloud SQL Cost Optimizer
 
 **Prompt:**
-```
+```text
 We have 14 Cloud SQL instances in us-central1. I suspect we're
 over-paying on HA configuration and oversized tiers. Run a cost audit.
 ```
@@ -351,7 +351,7 @@ over-paying on HA configuration and oversized tiers. Run a cost audit.
 **Agent:** Kubernetes FinOps Engineer
 
 **Prompt:**
-```
+```text
 We run GKE Standard clusters. We're seeing high idle node cost.
 Should we migrate to Autopilot? What changes to our workloads would
 be required?
@@ -376,7 +376,7 @@ be required?
 **Agent:** BigQuery Cost Optimizer
 
 **Prompt:**
-```
+```text
 Our BigQuery on-demand bill is $8,000/month. What are the top
 optimization opportunities?
 ```
@@ -403,7 +403,7 @@ optimization opportunities?
 **Agent:** Object Storage Class Auditor
 
 **Prompt:**
-```
+```text
 We have 200 TB in GCS buckets. Most were created with Standard storage.
 Audit and recommend lifecycle policies.
 ```
@@ -427,7 +427,7 @@ Audit and recommend lifecycle policies.
 **Agent:** Allocation & Policy Architect
 
 **Prompt:**
-```
+```text
 40% of our GCP spend is untagged. We need to enforce labels at
 resource creation, not after-the-fact. Explain the GCP approach.
 ```
@@ -451,7 +451,7 @@ resource creation, not after-the-fact. Explain the GCP approach.
 **Agent:** Cloud Onboarding Coordinator
 
 **Prompt:**
-```
+```text
 We're launching a new GCP project for the payments team next week.
 What needs to be in place before it goes live?
 ```

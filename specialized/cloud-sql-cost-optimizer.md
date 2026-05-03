@@ -88,7 +88,7 @@ Four outcomes:
 
 ### Instance charges (per-hour)
 
-```
+```text
 total_instance_cost = (vCPU_count × vCPU_rate)
                     + (memory_GB × memory_rate)
                     × HA_multiplier (1 or 2)

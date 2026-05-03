@@ -319,7 +319,7 @@ of reservation, BI Engine pays for itself in 6 days.
 **Doctrine pointers this agent assumes:**
 - [FOCUS Essentials](../doctrine/focus-essentials.md) -- BigQuery costs appear as `ServiceCategory='Analytics'` in GCP billing export; `sku.description` distinguishes query, storage, and streaming SKUs
 - [Iron Triangle](../doctrine/iron-triangle.md) -- partition pruning trades query flexibility for cost; capacity commitments trade flexibility for rate
-- [Data in the Path](../doctrine/data-in-the-path.md) -- cost estimates surface in the query tool before execution; slot alerts land in the oncall channel
+- [Data in the Path](../doctrine/data-in-the-path.md) -- cost estimates surface in the query tool before execution; slot alerts land in the on-call channel
 
 **Related agents:**
 - `data-platforms/focus-data-engineer.md` (BigQuery is the landing zone for GCP billing export; this agent optimizes BigQuery itself)

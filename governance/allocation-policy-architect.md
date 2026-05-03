@@ -203,7 +203,7 @@ for GCP estates. Unlike AWS (account-centric) or Azure
 **billing** (billing accounts), and adds **organizational structure**
 (folders) as a first-class concept.
 
-```
+```text
 Organization (example.com)
 ├── Folder: Engineering
 │   ├── Folder: Platform

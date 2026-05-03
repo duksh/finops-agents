@@ -272,7 +272,7 @@ discount is calculated on the pre-CUD usage curve; the CUD applies
 to what remains. Never model "SUD savings + CUD savings" as
 additive -- they're sequential:
 
-```
+```text
 List price: $1.00/hour
 SUD (25%): $0.75/hour effective
 CUD (resource-based, 57%): applies to $0.75 not $1.00

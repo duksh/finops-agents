@@ -370,7 +370,7 @@ GCP quota exhaustion causes workloads to fail silently (API 429s)
 which manifests as cost spikes when retry logic goes haywire. Wire
 quota utilization alerts via Cloud Monitoring:
 
-```
+```yaml
 metric.type="serviceruntime.googleapis.com/quota/exceeded"
 resource.labels.service="compute.googleapis.com"
 ```

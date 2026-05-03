@@ -158,7 +158,7 @@ more than necessary.
 
 **Autopilot billing formula:**
 
-```
+```text
 cost = (pod_cpu_request × cpu_rate)
      + (pod_memory_request × memory_rate)
      + (pod_ephemeral_storage_request × storage_rate)
