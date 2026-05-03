@@ -138,6 +138,133 @@ tag prefixes go into a small reference dimension that lets analysts
 distinguish provider-defined tags from user-defined tags within the
 JSON `Tags` column.
 
+## GCP FOCUS Pipeline
+
+### BigQuery billing export → FOCUS column mapping
+
+The GCP detailed billing export lands in BigQuery as
+`gcp_billing_export_resource_v1_<BILLING_ACCOUNT_ID>_*`. Key column
+translations to FOCUS:
+
+| GCP billing export column | FOCUS column | Notes |
+|---|---|---|
+| `billing_account_id` | `BillingAccountId` | Stable; use as join key |
+| `project.id` | `SubAccountId` | Use `.id`, not `.name` (mutable) |
+| `project.name` | `SubAccountName` | Informational only |
+| `service.description` | `ServiceName` | Normalize; verbose |
+| `sku.description` | `SkuDescription` | Very verbose; join via `sku.id` |
+| `usage_start_time` | `ChargePeriodStart` | Per-second granularity |
+| `usage_end_time` | `ChargePeriodEnd` | |
+| `cost + SUM(credits[].amount)` | `EffectiveCost` | Sum `credits[]` array |
+| `cost` | `ListCost` approximation | Pre-credit base cost |
+| `invoice.month` | `BillingPeriod` | YYYYMM format; convert to date |
+| `labels` | `Tags` | Array of `{key,value}`; flatten |
+| `cost_type` | `ChargeClass` | See mapping below |
+| `resource.name` | `ResourceName` | May be empty for SKU-only rows |
+| `resource.global_name` | `ResourceId` | Fully-qualified stable ID |
+
+**`cost_type` → `ChargeClass` mapping:**
+
+```sql
+CASE cost_type
+  WHEN 'regular'       THEN NULL           -- normal charge
+  WHEN 'tax'           THEN 'Tax'
+  WHEN 'adjustment'    THEN 'Correction'
+  WHEN 'rounding_error' THEN 'Correction'
+END AS ChargeClass
+```
+
+**EffectiveCost computation (credits are a nested array):**
+
+```sql
+SELECT
+  billing_account_id                            AS BillingAccountId,
+  project.id                                    AS SubAccountId,
+  service.description                           AS ServiceName,
+  sku.description                               AS SkuDescription,
+  usage_start_time                              AS ChargePeriodStart,
+  usage_end_time                                AS ChargePeriodEnd,
+  cost + IFNULL(
+    (SELECT SUM(c.amount) FROM UNNEST(credits) AS c), 0
+  )                                             AS EffectiveCost,
+  cost                                          AS BilledCost,  -- pre-credit
+  (SELECT TO_JSON_STRING(
+     ARRAY_AGG(STRUCT(l.key AS `key`, l.value AS `value`))
+   ) FROM UNNEST(labels) AS l)                 AS Tags,
+  CASE cost_type
+    WHEN 'adjustment'     THEN 'Correction'
+    WHEN 'rounding_error' THEN 'Correction'
+    WHEN 'tax'            THEN 'Tax'
+    ELSE NULL
+  END                                           AS ChargeClass
+FROM `MY_PROJECT.MY_DATASET.gcp_billing_export_resource_v1_*`
+WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+```
+
+### Credit restatement — critical pipeline design constraint
+
+**GCP amends historical billing data.** Unlike AWS CUR (which emits
+correction rows in the current period), GCP re-emits rows for past
+months when SUDs are recalculated (typically 2-3 days after month
+end) or when CUD coverage changes. This means:
+
+1. **Use `MERGE` not `INSERT` for GCP billing data.** Natural key:
+   `(billing_account_id, project.id, service.id, sku.id, usage_start_time, cost_type)`.
+   If using BigQuery as the warehouse, use `MERGE ... WHEN MATCHED THEN UPDATE`.
+
+2. **Do not freeze GCP billing periods before 5 days post-month-end.**
+   SUDs are finalized 2-3 days after month close; some CUD recalculations
+   take up to 5 days.
+
+3. **`cost_type = 'adjustment'`** rows are the explicit correction
+   signal -- they map to FOCUS `ChargeClass='Correction'` and should
+   be excluded from trend analysis but included in invoice
+   reconciliation.
+
+### Tags normalization for FOCUS
+
+GCP labels are stored as a REPEATED RECORD `{key, value}` in
+BigQuery. Flatten to FOCUS `Tags` JSON format:
+
+```sql
+-- Flatten GCP labels array to FOCUS JSON Tags
+SELECT
+  (SELECT TO_JSON_STRING(
+     ARRAY_AGG(STRUCT(l.key AS key, l.value AS value))
+   ) FROM UNNEST(labels) AS l
+   WHERE l.value IS NOT NULL
+  ) AS Tags
+```
+
+**GCP system labels** (prefixed with `goog-`) are provider-defined
+tags. Document these in your `dim_focus_metadata` tag-prefix
+dimension so downstream analysts can distinguish them from
+user-defined labels:
+
+- `goog-managed-by` — set by GCP services (e.g., `goog-managed-by: compute`)
+- `goog-gke-node` — set by GKE for node VMs
+- `goog-gke-volume` — set by GKE for persistent volumes
+
+### Cloud Billing API as streaming alternative
+
+For near-real-time pipelines (hourly ingestion), use the Cloud
+Billing API instead of waiting for the daily BigQuery export flush:
+
+```python
+from googleapiclient.discovery import build
+from datetime import datetime, timedelta
+
+billing = build('cloudbilling', 'v1beta')
+# billingAccounts.getCostSummary returns MTD spend per service
+result = billing.billingAccounts().getCostSummary(
+    name='billingAccounts/XXXXXX-YYYYYY-ZZZZZZ'
+).execute()
+```
+
+**Caveat:** the Billing API provides summary data, not line-item
+detail. Use it for budget monitoring pipelines; use BigQuery export
+for allocation and chargeback pipelines.
+
 ## Parallel-run migration support
 
 When migrating an organization onto FOCUS, follow the parallel-run

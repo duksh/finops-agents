@@ -162,6 +162,116 @@ Three coupled outputs:
 - Be direct when the chosen pattern is wrong for the workload --
   recommend migration
 
+## GCP Cloud Run & Vertex AI
+
+### Cloud Run cost model
+
+Cloud Run has two CPU allocation modes with dramatically different
+cost profiles:
+
+**CPU throttled (default):**
+- CPU is allocated only during request processing
+- Billed per 100ms of request duration × vCPU + GB-RAM
+- Minimum billing: 1 request at the minimum instance spec
+- Best for: bursty, low-latency workloads with significant idle time
+
+**CPU always allocated (`--cpu-always-allocated`):**
+- CPU allocated continuously, even when no requests are in flight
+- Enables background work, timers, streaming
+- Cost: doubles for idle instances (you pay even with 0 requests)
+- Never use for workloads that don't need continuous CPU; the cost
+  delta is 2-10x for low-traffic services
+
+**Cloud Run billing formula (throttled mode):**
+
+```
+cost = (CPU_vCPU × $0.00002400/vCPU-second)
+     + (memory_GB × $0.00000250/GB-second)
+     + (requests × $0.00000040 per request)
+```
+
+**Min-instances cost trap:** Each `--min-instances=N` instance
+charges idle CPU + memory continuously even with zero requests. A
+single always-on 1 vCPU / 512 MB Cloud Run service on always-allocated
+costs ~$15/month in idle. 20 services with `--min-instances=1` is
+~$300/month in floor cost before a single request is processed.
+
+Audit: `gcloud run services list --format=json | jq '.[].spec.template.metadata.annotations."autoscaling.knative.dev/minScale"'` -- any non-zero value needs a business justification.
+
+**Cloud Run cost decision tree:**
+
+```
+Is the workload bursty with variable traffic?
+  Yes → CPU throttled, min-instances=0
+  No → Is it serving real-time requests?
+    Yes → CPU throttled, min-instances=1 (for cold start SLA)
+    No → CPU always-allocated (background service)
+```
+
+**Cold starts:** ~250-500ms for Go/Node.js, ~1-3s for JVM.
+Provisioned concurrency eliminates cold starts but costs the same
+as always-allocated. Use ARM (`--cpu-architecture=arm64`)
+where possible -- same price, ~20% lower latency for most
+workloads.
+
+### Vertex AI cost model
+
+Vertex AI has three cost-relevant deployment patterns:
+
+**1. Shared Endpoint (Prediction API, no dedicated nodes):**
+- Billed per request by model and input/output tokens
+- Scales to zero; no idle cost
+- Best for: intermittent inference, < 100 QPS
+- ~10-100x cheaper than dedicated endpoints for low traffic
+
+**2. Dedicated Endpoint (model deployed to endpoint with nodes):**
+- Billed per node-hour of the underlying accelerator
+- Always-on even at 0 QPS
+- Best for: high-throughput inference requiring low latency SLA
+- Use autoscaling with `minReplicaCount=0` to scale-to-zero during
+  off-hours (accept cold-start latency on first request)
+
+**3. Vertex AI Training (Custom Jobs):**
+- Billed per accelerator-hour for the job duration
+- Checkpointing is mandatory for any training > 2 hours;
+  use `Spot` machines for a 60-70% discount
+
+**TPU vs GPU pricing decision:**
+
+| Scenario | Recommendation |
+|---|---|
+| PyTorch workloads | A100 / H100 GPU nodes |
+| JAX / TensorFlow workloads | TPU v5e or v5p (better price/FLOP) |
+| LLM inference (< 30B params) | L4 GPU (best $/throughput at mid-scale) |
+| LLM training (> 10B params) | TPU v5p pods (purpose-built for scale) |
+
+**Vertex AI Workbench (notebooks) cost trap:**
+
+Workbench instances charge by the hour even when idle. A
+`n1-standard-4` instance left running costs ~$200/month.
+
+Enforce auto-shutdown:
+
+```bash
+gcloud workbench instances update MY-INSTANCE \
+  --location=us-central1-a \
+  --idle-shutdown-timeout=60m \
+  --idle-shutdown=true
+```
+
+Add this to the Terraform provisioning module for all Workbench
+instances. It is not enabled by default.
+
+**Managed vs self-managed Vertex AI TCO:**
+
+Vertex AI adds ~20-40% over raw Compute Engine for managed training
+and prediction. The premium buys: managed container registry,
+automatic model versioning, A/B deployment, pipeline orchestration.
+For teams with ML platform maturity, the managed-service markup is
+worth it. For teams running a single model in production, evaluate
+Cloud Run + custom inference server (TorchServe, vLLM, Triton) as
+a cheaper alternative.
+
 ## Anti-patterns
 
 - **Lambda for steady high-throughput APIs.** Containers usually win.

@@ -194,6 +194,132 @@ def detect(segment_history: list[float], threshold: float = 3.0) -> dict | None:
 | **Speed** | Better alerts reduce time-to-detection-of-real-problems |
 | **Quality** | Fewer false positives = trust = action |
 
+## GCP Budget & Alert Deep-Dive
+
+### Cloud Billing Budgets API
+
+GCP budgets are managed via `billingbudgets.googleapis.com` and can be
+scoped to a **billing account** or filtered to specific **projects**,
+**services**, or **labels**. Unlike AWS budgets (account-scoped only),
+GCP budgets can filter down to a single label value, enabling per-team
+or per-product budget enforcement without separate billing accounts.
+
+```python
+from google.cloud import billing_budgets_v1
+
+client = billing_budgets_v1.BudgetServiceClient()
+budget = billing_budgets_v1.Budget(
+    display_name="team-platform-monthly",
+    budget_filter=billing_budgets_v1.Filter(
+        projects=["projects/my-project-id"],
+        services=["services/6F81-5844-456A"],  # Compute Engine
+        credit_types_treatment=(
+            billing_budgets_v1.Filter.CreditTypesTreatment
+            .EXCLUDE_ALL_CREDITS
+        ),
+    ),
+    amount=billing_budgets_v1.BudgetAmount(
+        specified_amount={"currency_code": "USD", "units": 5000}
+    ),
+    threshold_rules=[
+        billing_budgets_v1.ThresholdRule(threshold_percent=0.5),
+        billing_budgets_v1.ThresholdRule(threshold_percent=0.9),
+        billing_budgets_v1.ThresholdRule(
+            threshold_percent=1.0,
+            spend_basis=billing_budgets_v1.ThresholdRule.Basis.FORECASTED_SPEND,
+        ),
+    ],
+    notifications_rule=billing_budgets_v1.NotificationsRule(
+        pubsub_topic="projects/my-project/topics/billing-alerts",
+        schema_version="1.0",
+    ),
+)
+```
+
+**`thresholdRules` key decision:** use `FORECASTED_SPEND` basis on
+the 1.0 threshold rule (trajectory alert) rather than only
+`CURRENT_SPEND` (static threshold). This is the GCP equivalent of
+the "alert on trajectory" rule.
+
+**`allUpdatesRule` vs `thresholdRules`:** `allUpdatesRule` fires a
+Pub/Sub message on every budget update (noisy for programmatic
+consumption). Use `thresholdRules` for human-facing alerts; use
+`allUpdatesRule` only when you need a budget-event stream for
+automation (e.g., auto-disabling a project billing link).
+
+**Credit treatment:** `EXCLUDE_ALL_CREDITS` gives you unblended
+cost vs budget; `INCLUDE_ALL_CREDITS` includes SUDs and CUDs in
+the comparison. For engineering teams tracking net spend, include
+credits. For Finance comparing to PO commitments, exclude.
+
+### Cloud Monitoring Spend Alerts
+
+For per-service anomaly detection beyond budget thresholds:
+
+```yaml
+# Alert on GCS spend spike >2x 7-day average
+combiner: OR
+conditions:
+  - displayName: GCS monthly spend spike
+    conditionThreshold:
+      filter: >
+        resource.type="global"
+        metric.type="billing.googleapis.com/billing/monthly_cost"
+        metric.labels.service_description="Cloud Storage"
+      comparison: COMPARISON_GT
+      thresholdValue: 500   # USD
+      duration: 0s
+      aggregations:
+        - alignmentPeriod: 86400s
+          perSeriesAligner: ALIGN_MAX
+```
+
+`billing.googleapis.com/billing/monthly_cost` gives month-to-date
+spend per service; combine with a rolling baseline from BigQuery
+for z-score anomaly detection.
+
+### Quota Alerts
+
+GCP quota exhaustion causes workloads to fail silently (API 429s)
+which manifests as cost spikes when retry logic goes haywire. Wire
+quota utilization alerts via Cloud Monitoring:
+
+```
+metric.type="serviceruntime.googleapis.com/quota/exceeded"
+resource.labels.service="compute.googleapis.com"
+```
+
+Alert at 80% quota utilization before exhaustion hits. Quota
+increases take 2-5 business days; blind spots here are expensive.
+
+### BigQuery ML Anomaly Detection (Run-tier)
+
+For organizations with BigQuery as their cost warehouse, ARIMA_PLUS
+is the lowest-effort path to seasonal anomaly detection:
+
+```sql
+-- Train a model per service per project
+CREATE OR REPLACE MODEL `my_project.cost_models.bq_arima`
+OPTIONS(
+  model_type = 'ARIMA_PLUS',
+  time_series_timestamp_col = 'usage_date',
+  time_series_data_col = 'daily_cost',
+  time_series_id_col = 'service_id',
+  auto_arima = TRUE,
+  data_frequency = 'DAILY',
+  holiday_region = 'US'
+) AS
+SELECT DATE(usage_start_time) AS usage_date,
+       service.id AS service_id,
+       SUM(cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) c), 0)) AS daily_cost
+FROM `my_project.my_dataset.gcp_billing_export_resource_v1_*`
+WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+GROUP BY 1, 2;
+```
+
+Run `ML.DETECT_ANOMALIES` daily against the trained model; route
+results to Pub/Sub or directly to PagerDuty via Cloud Functions.
+
 ## FinOps Framework Anchors
 
 **Domain:** Quantify Business Value (Budgeting) + Understand Usage &

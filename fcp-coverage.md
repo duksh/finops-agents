@@ -22,7 +22,7 @@ Source: FCP course Lesson 7 -- 4 Domains, 18 canonical Capabilities.
 
 - [x] **Architecting for Cloud** -- Platform & SRE Cost Lead; Cross-AZ Egress Investigator
 - [x] **Rate Optimization** -- Commitment Discount Strategist; EDP Negotiation Coach
-- [x] **Workload Optimization** -- Kubernetes Workload Optimizer; S3 Storage Class Auditor; Idle & Orphaned Resource Hunter; Workload Cost Optimizer
+- [x] **Workload Optimization** -- Kubernetes Workload Optimizer; Object Storage Class Auditor; Idle & Orphaned Resource Hunter; Workload Cost Optimizer; BigQuery Cost Optimizer; Cloud SQL Cost Optimizer
 - [x] **Cloud Sustainability** -- Cloud Sustainability Analyst
 - [x] **Licensing & SaaS** -- License & SaaS Cost Optimizer
 
@@ -39,5 +39,5 @@ Source: FCP course Lesson 7 -- 4 Domains, 18 canonical Capabilities.
 
 ---
 
-**Coverage: 22 / 22 Framework Capabilities** (100%)
+**Coverage: 22 / 22 Framework Capabilities** (100%) — 26 agents total
 

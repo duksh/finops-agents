@@ -223,6 +223,82 @@ ORDER BY unused_cost DESC;
 - Pricing structures changed aggressively in recent years -- stay
   current
 
+#### GCP Recommender API Integration
+
+The Recommender API (`recommender.googleapis.com`) provides
+machine-generated CUD purchase recommendations. Use it before
+any manual portfolio analysis -- it surfaces commitment gaps
+the billing export alone won't show:
+
+```python
+from google.cloud import recommender_v1
+
+client = recommender_v1.RecommenderClient()
+parent = (
+    "projects/my-project/locations/us-central1/"
+    "recommenders/google.compute.commitment.UsageCommitmentRecommender"
+)
+recommendations = client.list_recommendations(parent=parent)
+for rec in recommendations:
+    subtype = rec.recommender_subtype  # INCREASE_COMMITMENT or SWITCH_TO_CUD
+    impact = rec.primary_impact.cost_projection.cost
+    print(f"{subtype}: save {impact.units} {impact.currency_code}/month")
+```
+
+Key `recommenderSubtype` values and how to use them:
+
+- `INCREASE_COMMITMENT` — you have an existing CUD but usage
+  consistently exceeds it; buy more at the same type
+- `SWITCH_TO_COMMITTED_USE_DISCOUNT_FOR_COMMITMENT` — usage pattern
+  is stable enough to convert from on-demand or SUD-only to CUD;
+  the API has already done the 90-day stability check for you
+- `DECREASE_COMMITMENT` — rare, signals over-committed usage;
+  treat as a CUD modification trigger, not a purchase signal
+
+**CUD automation pattern (Cloud Asset Inventory + Recommender):**
+
+1. Schedule a Cloud Function to poll Recommender API weekly
+2. Filter for `STATE_ACTIVE` recommendations only (not `SUCCEEDED`
+   or `FAILED` -- those are historical)
+3. For `INCREASE_COMMITMENT` recs above $500/month impact: auto-open
+   a Jira ticket routed to FinOps team
+4. For `SWITCH_TO_CUD` recs: require human approval; auto-close
+   after 30 days if no action
+
+**SUD and CUD overlap — the math that's frequently wrong:**
+
+GCP applies discounts in order: SUD first, then CUD. The SUD
+discount is calculated on the pre-CUD usage curve; the CUD applies
+to what remains. Never model "SUD savings + CUD savings" as
+additive -- they're sequential:
+
+```
+List price: $1.00/hour
+SUD (25%): $0.75/hour effective
+CUD (resource-based, 57%): applies to $0.75 not $1.00
+Net: $0.75 × (1 - 0.57) = $0.32/hour
+```
+
+In FOCUS terms: the `EffectiveCost` already reflects both; the
+native export's `credits[]` shows them separately. When modeling
+potential new CUDs, base the savings on the `cost_after_credits`
+column (post-SUD), not `cost_at_list`.
+
+**Billing account-level CUD sharing:**
+
+By default, CUDs are project-scoped. Enable sharing at the billing
+account level via the GCP console or API to let any project in the
+billing account consume the commitment. This is almost always the
+right choice for organizations with multiple projects -- it mirrors
+how AWS Compute SPs apply at the payer level.
+
+Enable: GCP Console → Billing → Commitments → Edit →
+"Share with billing account"
+
+Exception: disable sharing for projects that must have fully
+isolated cost attribution (regulated workloads, strict chargeback
+environments). Document the decision; it's easy to miss.
+
 ### OCI
 
 - Universal Credits and BYOL apply discounts upstream of commitments;

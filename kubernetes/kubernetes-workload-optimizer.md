@@ -151,6 +151,99 @@ capacity, without regressing reliability or scheduling latency SLOs.
 | **Speed** | Rightsizing too aggressive → OOMKills → developer trust loss → rollback. Stage carefully. |
 | **Quality** | Better-tuned requests yield better scheduling decisions; tighter consolidation increases pod-restart pressure -- pick the right point |
 
+## GKE-Specific Optimization
+
+### Spot pods on GKE Autopilot
+
+Autopilot Spot pods are different from Standard Spot node pools.
+In Autopilot, spot is a **pod-level** annotation, not a node pool
+setting:
+
+```yaml
+spec:
+  nodeSelector:
+    cloud.google.com/gke-spot: "true"
+  tolerations:
+    - key: cloud.google.com/gke-spot
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+```
+
+Autopilot Spot pods are charged at the Spot rate (~60-70% discount
+vs on-demand). GCP provides a 30-second eviction notice (vs AWS
+Spot's 2-minute notice) -- graceful termination hooks must complete
+in 30 seconds. Adjust `terminationGracePeriodSeconds` accordingly.
+
+### GKE Standard: Node auto-provisioning (NAP)
+
+Node auto-provisioning dynamically creates node pools to match
+pending pod requirements. It's Karpenter's GKE equivalent, but
+with different defaults:
+
+```yaml
+# cluster.nodePoolAutoConfig (in Terraform)
+node_pool_auto_config {
+  resource_manager_tags = {}
+  network_config {
+    create_pod_range = true
+  }
+}
+```
+
+NAP cost traps:
+- By default, NAP uses on-demand nodes; add `spot: true` to the
+  autoprovisioning config to allow spot nodes
+- NAP respects pod resource requests strictly; over-sized requests
+  cause NAP to provision larger (more expensive) node pools
+- NAP does not consolidate across node pools -- a 1-pod node stays
+  provisioned unless you enable cluster autoscaler consolidation
+  separately
+
+**NAP vs Karpenter on GKE:** Karpenter is available on GKE (via
+the `karpenter.k8s.aws` provider adapted for GKE) but is less
+mature than the native NAP. Default to NAP for GKE; migrate to
+Karpenter only when NAP's constraints are measurably costing money.
+
+### GKE Autopilot VPA behavior
+
+In GKE Autopilot, VPA is **automatic and mandatory** for most
+workloads. You cannot disable it at the pod level. The implications:
+
+- Pod resource requests may be adjusted at pod recreation time by
+  GKE -- your IaC-declared requests are the floor, not the ceiling
+- Monitor actual billed requests (from the cost allocation BigQuery
+  tables) vs declared requests; if they diverge, GKE is
+  auto-adjusting and you should update your IaC to match
+- VPA will NOT reduce requests below the pod's observed usage -- it
+  only increases or right-sizes
+
+### Preemptible vs Spot on GKE Standard
+
+GCP has **two** discounted compute types for GKE Standard nodes:
+
+| Type | Max runtime | Eviction notice | Discount |
+|---|---|---|---|
+| Preemptible | 24 hours | 30 seconds | ~60-65% |
+| Spot | Unlimited | 30 seconds | ~60-70% |
+
+**Spot is strictly better than Preemptible** for new workloads:
+no 24-hour limit and higher potential discount. Migrate any existing
+preemptible node pools to Spot node pools.
+
+```bash
+# Create a Spot node pool
+gcloud container node-pools create spot-pool \
+  --cluster=MY-CLUSTER \
+  --region=us-central1 \
+  --machine-type=n2-standard-4 \
+  --spot \
+  --num-nodes=0 \
+  --enable-autoscaling \
+  --min-nodes=0 \
+  --max-nodes=20
+```
+
 ## FinOps Framework Anchors
 
 **Domain:** Optimize Usage & Cost

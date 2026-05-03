@@ -197,6 +197,113 @@ script failures.
 - [Data in the Path](../doctrine/data-in-the-path.md) -- waste reports land in the owner's Slack / Jira / GitHub PR check, not a FinOps wiki
 - [FCP Canon Anchors](../doctrine/fcp-anchors.md) -- Joe Daly's tag-driven EBS pattern; J.R. Storment's $200K dev-environment story
 
+## GCP Idle Resource Patterns
+
+GCP has a distinct set of idle resource traps beyond the
+AWS/Azure patterns above. Add these to the quarterly hunt.
+
+### Compute Engine idle instances
+
+```bash
+# List instances with < 5% CPU for 14 days via Cloud Monitoring
+gcloud monitoring time-series list \
+  --filter='metric.type="compute.googleapis.com/instance/cpu/utilization"' \
+  --interval-start-time=$(date -d '14 days ago' -u +%Y-%m-%dT%H:%M:%SZ) \
+  --interval-end-time=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --aggregation-per-series-aligner=ALIGN_MEAN \
+  --aggregation-cross-series-reducer=REDUCE_MEAN \
+  --format=json | jq '.[] | select(.points[].value.doubleValue < 0.05)'
+```
+
+Or query from BigQuery (more practical at scale) using exported
+Cloud Monitoring metrics. Instances with mean CPU < 5% over 14
+days and no inbound network traffic are `obvious` tier.
+
+**GCP-specific classification exceptions:**
+- Instances with label `role=bastion` or `role=vpn-gateway` are
+  intentionally idle; exempt them
+- Instances in unmanaged instance groups may serve traffic via
+  internal LB even at 0% CPU -- check forwarding rule association
+
+### Unattached persistent disks
+
+```bash
+# List all disks with no users (unattached)
+gcloud compute disks list \
+  --filter="users:[]" \
+  --format="table(name,zone,sizeGb,type,status,creationTimestamp)"
+```
+
+GCP persistent disk pricing: Standard ~$0.04/GB/month, SSD
+~$0.17/GB/month. A 500 GB unattached SSD disk = $85/month waste.
+Snapshot before delete; hold snapshots for 30 days. Priority:
+`ssd` disks over `standard`.
+
+### Cloud SQL idle instances
+
+```bash
+# List Cloud SQL instances with zero connections for 7+ days
+gcloud sql instances list --format="value(name,region,databaseVersion)"
+# Then check via Cloud Monitoring:
+# cloudsql.googleapis.com/database/network/connections
+# If max(connections) == 0 over 7 days → idle candidate
+```
+
+Cloud SQL HA instances (doubling cost) that are idle for 7 days
+are the highest-priority target. A `db-n1-standard-4` HA instance
+is ~$380/month; same instance idle in dev is $380/month wasted.
+
+### Static external IP addresses
+
+GCP charges ~$7.20/month for a static external IP not attached to
+a running resource. These accumulate from:
+- Deleted instances that had reserved IPs
+- Load balancers deleted without releasing their IPs
+- VPN gateway addresses from decommissioned connections
+
+```bash
+# Find all reserved but unassigned static IPs
+gcloud compute addresses list \
+  --filter="status=RESERVED" \
+  --format="table(name,region,address,status,addressType)"
+```
+
+**Release or delete any RESERVED address that's been unassigned
+for > 7 days.** There's no ambiguity here -- a RESERVED address
+with no resource attached is always waste.
+
+### Unused load balancers
+
+```bash
+# List forwarding rules (each is a load balancer front-end)
+gcloud compute forwarding-rules list \
+  --format="table(name,region,IPAddress,target,loadBalancingScheme)"
+```
+
+Then check `loadbalancing.googleapis.com/https/request_count` in
+Cloud Monitoring. Zero request count for 30 days + no healthy
+backends in the backend service = orphaned LB.
+
+**GCP LB cost structure:** Global HTTPS LB ~$18/month base +
+$0.008/1k requests + LCU charges. A zero-traffic global LB is
+$18/month minimum waste.
+
+### Orphaned persistent disk snapshots
+
+GCP persistent disk snapshots bill at ~$0.026/GB/month. Snapshots
+of deleted disks (no source disk) are almost always orphaned:
+
+```bash
+# Find snapshots whose source disk no longer exists
+gcloud compute snapshots list \
+  --format="table(name,sourceDisk,diskSizeGb,creationTimestamp,storageLocations)" \
+  | grep -v "https://"  # sourceDisk URL present means disk still exists
+```
+
+Apply the Joe Daly tag-and-notify pattern: tag orphaned snapshots
+with `status=pending-deletion`, notify the last operator (from
+Cloud Audit Logs), delete after 30 days with no response.
+
 **Related playbooks:**
 - [Snapshot Sprawl](../playbooks/snapshot-sprawl.md)
 - [Idle Load Balancer](../playbooks/idle-load-balancer.md)

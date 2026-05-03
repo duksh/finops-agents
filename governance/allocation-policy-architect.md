@@ -193,6 +193,134 @@ the allocation hierarchy so it survives organizational change.
 | **Speed** | `deny` policies slow new resource creation by seconds-to-minutes; the trade is real but small. Exception workflow is the release valve. |
 | **Quality** | Mandatory tags are how reports get trusted. Without them, every analysis caveats "excludes untagged spend." |
 
+## GCP Project Hierarchy as Allocation Anchor
+
+### Organization → Folder → Project structure
+
+GCP's resource hierarchy is the most natural cost allocation anchor
+for GCP estates. Unlike AWS (account-centric) or Azure
+(subscription-centric), GCP separates **identity** (projects) from
+**billing** (billing accounts), and adds **organizational structure**
+(folders) as a first-class concept.
+
+```
+Organization (example.com)
+├── Folder: Engineering
+│   ├── Folder: Platform
+│   │   ├── Project: platform-prod        → Billing Account A
+│   │   └── Project: platform-dev         → Billing Account B
+│   └── Folder: Product-A
+│       ├── Project: product-a-prod
+│       └── Project: product-a-staging
+└── Folder: Finance-Systems
+    └── Project: finance-erp-prod
+```
+
+**Use `project.id` (not `project.name`) as your allocation key.**
+`project.name` is mutable; `project.id` is immutable. In the
+billing export, `project.id` maps to FOCUS `SubAccountId` and
+is the stable join key across all cost periods.
+
+**Folder structure as a cost roll-up hierarchy:**
+
+The billing export does not include folder membership natively.
+Use the Cloud Asset Inventory to build a `dim_project_hierarchy`
+table that maps `project.id → folder chain → org`:
+
+```python
+from google.cloud import asset_v1
+
+client = asset_v1.AssetServiceClient()
+projects = client.search_all_resources(
+    scope="organizations/MY_ORG_ID",
+    asset_types=["cloudresourcemanager.googleapis.com/Project"],
+    query="",
+)
+# Extract project.parent (folder or org) for each project
+```
+
+Refresh this dimension daily; project-to-folder moves are
+rare but do happen during reorganizations.
+
+### Label enforcement on GCP (label inheritance gap)
+
+**GCP labels do NOT inherit from folders or organizations to
+projects or resources.** This is the most common misunderstanding
+from engineers migrating from AWS (where tag policies can enforce
+inheritance). Every resource must be explicitly labeled.
+
+Enforce labels via **Organization Policy custom constraints**:
+
+```yaml
+# custom_constraint_require_env_label.yaml
+name: organizations/MY_ORG_ID/customConstraints/custom.requireEnvLabel
+resourceTypes:
+  - compute.googleapis.com/Instance
+  - storage.googleapis.com/Bucket
+  - container.googleapis.com/Cluster
+methodTypes: [CREATE, UPDATE]
+condition: >
+  resource.labels.exists(label, label.key == "env")
+actionType: ALLOW
+displayName: Require env label on all resources
+description: All compute, storage, and GKE resources must have an 'env' label.
+```
+
+Attach this constraint to the org or folder level and set it to
+`enforce: true`. Unlike `warn`-only, this blocks resource creation.
+
+### Shared VPC billing attribution
+
+In a Shared VPC topology, network resources (Cloud NAT, Load
+Balancers, firewall rules) bill to the **host project**, not the
+service projects consuming them. This breaks per-team attribution
+unless explicitly split.
+
+Resolution path:
+1. Tag Shared VPC network resources with `team` labels that map to
+   consuming service projects
+2. Use **Network Intelligence Center** to see per-project traffic
+   volumes if proportional allocation is needed
+3. For chargeback, split host-project networking costs by
+   `(service_project_traffic / total_traffic)` per period
+
+### IAM conditions as cost-governance enforcement
+
+GCP IAM conditions allow attribute-based access control on
+resource metadata. Use them to enforce that engineers can only
+create resources with required labels:
+
+```json
+{
+  "expression": "resource.name.startsWith('projects/') && resource.type == 'compute.googleapis.com/Instance' && resource.labels.team != ''",
+  "title": "Require team label for Compute Engine creation",
+  "description": "Block instance creation without a non-empty team label"
+}
+```
+
+Attach as a condition on the `roles/compute.instanceAdmin` binding
+at the folder level. Engineers without the `team` label in their
+IaC get a 403; correct the IaC, not the policy.
+
+### Billing account linkage audit
+
+```bash
+# Audit which projects are linked to which billing accounts
+gcloud billing projects list \
+  --billing-account=XXXXXX-YYYYYY-ZZZZZZ \
+  --format="table(projectId, billingAccountName, billingEnabled)"
+
+# Find projects with billing disabled (no charges, but still exist)
+gcloud projects list --filter="lifecycleState=ACTIVE" \
+  --format="value(projectId)" | while read pid; do
+    gcloud billing projects describe "$pid" \
+      --format="value(projectId,billingEnabled,billingAccountName)"
+done
+```
+
+Projects with `billingEnabled=false` are either intentionally
+free-tier only or misconfigured. Flag for review quarterly.
+
 ## FinOps Framework Anchors
 
 **Domain:** Understand Usage & Cost (Allocation) + Manage the FinOps

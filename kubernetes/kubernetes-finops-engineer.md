@@ -67,6 +67,106 @@ for chargeback or showback.
 - Always show utilization alongside allocation -- cost without utilization is incomplete
 - Treat multi-tenant clusters as the rule, not the exception
 
+## GKE-Specific Cost Allocation
+
+### Autopilot vs Standard cost model
+
+**GKE Autopilot** and **GKE Standard** have fundamentally different
+billing models. Choosing the wrong one for a workload costs 30-60%
+more than necessary.
+
+| Dimension | Autopilot | Standard |
+|---|---|---|
+| Billing unit | Per Pod resource request | Per node-hour |
+| Node visibility | None (Google-managed) | Full |
+| Idle cost | Zero (no node cost when no pods) | Idle node-hours billed |
+| Bin-packing control | Automatic | Manual (Karpenter/CA) |
+| Spot support | `scheduling.gke.io/gke-spot: "true"` on pod | Node pool level |
+| Min resource per pod | CPU: 0.25 vCPU, Memory: 0.5 GB | None |
+
+**Autopilot billing formula:**
+
+```
+cost = (pod_cpu_request × cpu_rate)
+     + (pod_memory_request × memory_rate)
+     + (pod_ephemeral_storage_request × storage_rate)
+```
+
+Requests are rounded up to the nearest Autopilot resource class
+(micro / small / medium / large / xlarge). A pod requesting 0.3
+vCPU bills at 0.5 vCPU. **Right-sizing requests is more important
+in Autopilot than in Standard** -- over-requested pods directly
+multiply cost with no offset from unused node headroom.
+
+**When Autopilot wins:** bursty workloads with irregular schedules,
+dev/staging environments, teams without Kubernetes expertise, any
+workload where idle-time cost is the dominant concern.
+
+**When Standard wins:** large steady-state workloads with predictable
+shape, ML training (GPU/TPU node pools), workloads needing custom
+kernel configuration, high-throughput networking requirements.
+
+### GKE Cost Allocation feature
+
+Enable cost allocation to surface per-namespace and per-label
+breakdowns in the GCP billing export:
+
+```bash
+gcloud container clusters update MY-CLUSTER \
+  --region=us-central1 \
+  --resource-usage-bigquery-dataset=my_billing_dataset \
+  --enable-network-egress-metering \
+  --enable-resource-consumption-metering
+```
+
+This requires:
+1. Namespaces have resource quotas set (LimitRanges alone are
+   insufficient)
+2. All pods have resource requests (no requests = no allocation)
+
+The output lands in BigQuery as
+`gke_cluster_resource_usage_*` tables, joinable to the billing
+export via `cluster_name` and `namespace`.
+
+Map these into FOCUS `Tags` via the FOCUS data engineer pipeline
+to make GKE namespace costs joinable to non-GKE costs in the
+warehouse.
+
+### Regional vs Zonal cluster cost
+
+**Regional clusters** (3-zone control plane) charge an additional
+control plane fee on top of the per-node cost. Zonal clusters have
+one control plane zone (no additional fee at Autopilot tier).
+
+For production workloads: pay the regional premium -- it's
+typically <5% of total cluster cost and buys multi-zone control
+plane availability.
+
+For dev/staging: use zonal clusters or Autopilot to avoid the
+regional premium while retaining workload isolation.
+
+### NEG load balancers vs classic LBs
+
+**Container-native load balancing via NEGs** (Network Endpoint
+Groups) routes traffic directly to pod IPs, eliminating the
+double-hop via `kube-proxy` (`NodePort`). This reduces:
+
+- Load balancer LCU charges (fewer health checks, more efficient
+  connection distribution)
+- Inter-VM network traffic cost (no `NodePort` fan-out)
+
+Enable NEGs by adding the `cloud.google.com/neg` annotation:
+
+```yaml
+metadata:
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+```
+
+The `BackendConfig` resource configures health checks and session
+affinity. For high-traffic services, NEG adoption typically
+reduces networking cost by 10-20%.
+
 ## FinOps Framework Anchors
 
 **Domain:** Understand Usage & Cost
