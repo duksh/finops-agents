@@ -151,6 +151,96 @@ capacity, without regressing reliability or scheduling latency SLOs.
 | **Speed** | Rightsizing too aggressive → OOMKills → developer trust loss → rollback. Stage carefully. |
 | **Quality** | Better-tuned requests yield better scheduling decisions; tighter consolidation increases pod-restart pressure -- pick the right point |
 
+## AKS-Specific Optimization
+
+### Azure Spot VMs in AKS node pools
+
+Azure Spot VMs offer up to 90% discount over pay-as-you-go for workloads
+that tolerate eviction. In AKS, Spot VMs are available as node pool
+configurations:
+
+```bash
+# Create a Spot node pool
+az aks nodepool add \
+  --cluster-name MY-CLUSTER \
+  --resource-group MY-RG \
+  --name spotpool \
+  --priority Spot \
+  --eviction-policy Delete \
+  --spot-max-price -1 \   # -1 = use Azure's current market price cap
+  --node-count 0 \
+  --enable-cluster-autoscaler \
+  --min-count 0 \
+  --max-count 20 \
+  --node-vm-size Standard_D4s_v5
+```
+
+**`--eviction-policy Delete` vs `Deallocate`:**
+- `Delete` terminates the node immediately on eviction (no ongoing disk cost)
+- `Deallocate` stops the VM but retains the disk (cheaper restart, ongoing
+  storage cost)
+
+Use `Delete` for stateless workloads; `Deallocate` is rarely the right
+choice on k8s since pods reschedule anyway.
+
+**AKS Spot node taint:** AKS automatically applies a taint to Spot nodes:
+
+```yaml
+tolerations:
+  - key: "kubernetes.azure.com/scalesetpriority"
+    operator: "Equal"
+    value: "spot"
+    effect: "NoSchedule"
+```
+
+Add this toleration to workload manifests that should run on Spot nodes.
+
+**Eviction notice:** Azure Spot VMs provide a 30-second eviction notice
+via the Azure Instance Metadata Service. Wire a `PreStop` hook or
+SIGTERM handler to drain gracefully within 30 seconds.
+
+### Virtual Nodes (ACI burst)
+
+AKS Virtual Nodes use Azure Container Instances (ACI) for burst capacity.
+ACI is billed per-second of actual CPU and memory used (no node hourly
+charge) — ideal for unpredictable spike workloads that don't justify
+a dedicated node pool:
+
+```bash
+# Enable Virtual Nodes on an AKS cluster
+az aks enable-addons \
+  --name MY-CLUSTER \
+  --resource-group MY-RG \
+  --addons virtual-node \
+  --subnet-name aci-subnet
+```
+
+Cost model: ACI charges `$0.0000135/vCPU-second` + `$0.0000015/GB-second`.
+A 2-vCPU, 4 GB pod running for 10 minutes: $0.016. The same workload
+on a `Standard_D2s_v5` node for 10 minutes: ~$0.009. ACI is more
+expensive per-hour but has zero idle cost — use it only for burst,
+not as a baseline.
+
+### AKS Arm64 (Ampere Altra) node pools
+
+Azure offers Arm64-based VMs (`Dpsv5`, `Epsv5` series) at ~20-30%
+lower price per vCPU vs comparable x86 (`Dsv5`) VMs. AKS supports
+Arm64 node pools with a multi-arch cluster image:
+
+```bash
+az aks nodepool add \
+  --cluster-name MY-CLUSTER \
+  --resource-group MY-RG \
+  --name arm64pool \
+  --node-vm-size Standard_D4ps_v5 \  # Arm64 VM
+  --os-type Linux
+```
+
+Workloads must be compiled for `linux/arm64`. Most Go, Python, and
+Node.js workloads run without modification; JVM workloads may need
+testing. Use a mixed-arch cluster and node affinity to route
+compatible workloads to Arm64 pools.
+
 ## GKE-Specific Optimization
 
 ### Spot pods on GKE Autopilot

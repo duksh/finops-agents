@@ -225,16 +225,22 @@ Higher-leverage niches.
 
 ---
 
-## Playbooks (10 named patterns)
+## Playbooks (14 named patterns)
 
 Named-pattern writeups for specific failure modes. Cite them by name.
 
-**Cloud resource waste:**
+**Cloud resource waste (AWS):**
 - [Zombie NAT Gateway](./playbooks/zombie-nat-gateway.md)
 - [Snapshot Sprawl](./playbooks/snapshot-sprawl.md)
 - [Cross-AZ Chatterbox](./playbooks/cross-az-chatterbox.md)
 - [Idle Load Balancer](./playbooks/idle-load-balancer.md)
 - [Oversized RDS](./playbooks/oversized-rds.md)
+
+**Cloud resource waste (GCP):**
+- [Cloud SQL HA in Dev](./playbooks/cloud-sql-ha-in-dev.md) -- HA enabled on non-production databases, silently doubling instance cost
+- [GCS Multi-Region Sprawl](./playbooks/gcs-multi-region-sprawl.md) -- buckets in multi-region/dual-region when single-region meets the requirement
+- [BigQuery SELECT * Drift](./playbooks/bigquery-select-star-drift.md) -- unpartitioned full-table scans from dashboards and ad-hoc queries
+- [GKE Autopilot Request Bloat](./playbooks/gke-autopilot-request-bloat.md) -- production-sized pod requests copied into dev/staging Autopilot clusters
 
 **Reporting / allocation / governance patterns (FCP-anchored):**
 - [Untagged Spend Drift](./playbooks/untagged-spend-drift.md)

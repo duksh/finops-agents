@@ -162,6 +162,91 @@ Three coupled outputs:
 - Be direct when the chosen pattern is wrong for the workload --
   recommend migration
 
+## Azure Functions & Azure-Specific Serverless
+
+### Azure Functions hosting plans
+
+Azure Functions has three hosting plans with very different cost models:
+
+| Plan | Billing | Cold start | Best for |
+|---|---|---|---|
+| **Consumption** | Per execution + GB-seconds | Yes (~1-3s) | Infrequent, bursty invocations |
+| **Premium** | Per vCPU-second + GB-second (always-warm) | No (pre-warmed) | SLA-sensitive, VNet-required |
+| **Dedicated (App Service)** | Per App Service Plan hour | No | Steady-state, shared with other apps |
+
+**Consumption plan cost formula:**
+
+```
+cost = (executions × $0.20/million)
+     + (GB-seconds × $0.000016/GB-second)
+```
+
+First 1M executions and 400,000 GB-seconds are free per month.
+For a function running 10M times/month at 200ms with 512 MB:
+`10M × $0.20/1M + (10M × 0.2s × 0.5GB × $0.000016) = $2 + $16 = $18/month`
+
+**Premium plan cost trap:** Premium plan has a minimum of 1 always-warm
+instance. At the smallest SKU (EP1: 1 vCPU, 3.5 GB RAM):
+`$0.173/hour × 730 hours = ~$126/month` floor — regardless of invocations.
+Only justified when cold start latency or VNet integration is required.
+
+**When to leave Consumption:** Over ~$5k/month in Consumption plan,
+evaluate App Service Plan or containerization (Azure Container Apps,
+AKS) — steady high-volume is always cheaper on reserved compute.
+
+### Azure Functions memory sizing (Power Tuning)
+
+Unlike Lambda (where memory directly sets CPU), Azure Functions on
+Consumption plan allocates CPU proportionally to memory. The same
+"right memory" optimization applies:
+
+- More memory → more CPU → faster execution → fewer GB-seconds billed
+- Test at 128 MB, 256 MB, 512 MB, 1024 MB, and 1536 MB (the max)
+- Optimal is rarely the minimum; fast execution often reduces total cost
+
+Use the [Azure Functions Power Tuning](https://github.com/scale-tone/azure-function-power-tuner)
+tool for automated testing — analogous to AWS Lambda Power Tuning.
+
+### Azure Container Apps vs Functions
+
+Azure Container Apps (ACA) is the managed-container alternative to Functions
+for workloads that need longer execution times, custom runtimes, or HTTP-based
+APIs. ACA scales to zero on the Consumption workload profile:
+
+```bash
+# Deploy a containerized workload that scales to zero
+az containerapp create \
+  --name my-api \
+  --resource-group MY-RG \
+  --environment MY-ACA-ENV \
+  --image myregistry.azurecr.io/my-api:latest \
+  --min-replicas 0 \
+  --max-replicas 10 \
+  --target-port 8080 \
+  --ingress external
+```
+
+ACA Consumption billing: `$0.000024/vCPU-second` + `$0.000003/GB-second`
+(same structure as Azure Functions Premium but container-native).
+
+Over $5k/month in Azure Functions: run the ACA vs Functions TCO comparison
+before migrating. The difference is often 20-40% in favor of ACA for
+HTTP APIs with > 100 concurrent requests.
+
+### Azure Durable Functions cost profile
+
+Durable Functions use Azure Storage (queues, tables, blobs) for
+orchestration state. The storage cost is often invisible until scale:
+
+- 1M orchestrations/month with 10 activities each:
+  ~500k queue operations + ~1M table operations + blob storage
+  ≈ ~$15-50/month in storage alone, separate from compute
+- For high-throughput workflows, use the **Netherite storage provider**
+  (backed by Azure Event Hubs) which is faster and cheaper at scale
+
+Always include Storage cost in Durable Functions cost analysis.
+The compute cost is only half the picture.
+
 ## GCP Cloud Run & Vertex AI
 
 ### Cloud Run cost model

@@ -197,6 +197,112 @@ script failures.
 - [Data in the Path](../doctrine/data-in-the-path.md) -- waste reports land in the owner's Slack / Jira / GitHub PR check, not a FinOps wiki
 - [FCP Canon Anchors](../doctrine/fcp-anchors.md) -- Joe Daly's tag-driven EBS pattern; J.R. Storment's $200K dev-environment story
 
+## Azure Idle Resource Patterns
+
+Azure has its own set of idle resource traps beyond the AWS patterns.
+Azure Advisor surfaces many of these automatically, but Advisor
+recommendations must be acted on — they don't self-remediate.
+
+### Idle Virtual Machines
+
+Azure Advisor flags VMs with < 5% average CPU utilization over 14 days
+as "right-size or shut down" candidates. Pull these programmatically:
+
+```bash
+# List all Azure Advisor cost recommendations (includes idle VMs)
+az advisor recommendation list \
+  --category "Cost" \
+  --query "[?impactedField=='Microsoft.Compute/virtualMachines']" \
+  --output table
+```
+
+For direct metric-based detection:
+
+```bash
+# Find VMs with < 5% avg CPU over 14 days via Azure Monitor
+az monitor metrics list \
+  --resource "/subscriptions/MY-SUB/resourceGroups/MY-RG/providers/Microsoft.Compute/virtualMachines/MY-VM" \
+  --metric "Percentage CPU" \
+  --interval PT1H \
+  --aggregation Average \
+  --start-time $(date -d '14 days ago' -u +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --query "value[0].timeseries[0].data[*].average"
+```
+
+Alternatively, use Azure Resource Graph for fleet-level querying:
+
+```bash
+# Azure Resource Graph: VMs not started in 30 days
+az graph query -q "
+Resources
+| where type =~ 'microsoft.compute/virtualmachines'
+| extend powerState = properties.extended.instanceView.powerState.code
+| where powerState =~ 'PowerState/deallocated'
+| project name, resourceGroup, location, powerState, tags
+" --output table
+```
+
+### Unattached Managed Disks
+
+Unattached managed disks accumulate from deleted VMs that had their disks
+preserved. Premium SSD P10 (128 GB): ~$19/month. P40 (2 TB): ~$300/month.
+
+```bash
+# List all unattached managed disks
+az disk list \
+  --query "[?diskState=='Unattached']" \
+  --output table \
+  --query "[?diskState=='Unattached'].{Name:name, RG:resourceGroup, Size:diskSizeGb, Tier:sku.name, Cost:managedBy}"
+```
+
+Snapshot before delete; hold for 30 days. Set a Azure Policy to
+alert when disks remain unattached for > 7 days.
+
+### Orphaned Public IP Addresses
+
+Azure charges for reserved public IPs not associated with a running
+resource: ~$3.65/month per static IP.
+
+```bash
+# Find all public IPs not associated with any resource
+az network public-ip list \
+  --query "[?ipConfiguration==null].{Name:name, RG:resourceGroup, IP:ipAddress, Sku:sku.name}" \
+  --output table
+```
+
+Any IP with `ipConfiguration==null` is unassociated. Delete unless
+it's a documented DR / failover address.
+
+### Unused Application Gateways and Load Balancers
+
+Azure Application Gateway: ~$125/month base (v2 Standard) before
+capacity unit charges. Standard Load Balancer: ~$18/month base.
+
+```bash
+# Find Application Gateways with no backend instances
+az network application-gateway list \
+  --query "[].{Name:name, RG:resourceGroup, BackendPools:backendAddressPools}" \
+  --output json | jq '.[] | select(.BackendPools[].backendAddresses | length == 0)'
+```
+
+Cross-reference with Azure Monitor `ApplicationGatewayTotalRequests`
+metric: zero requests over 30 days + no healthy backends = orphaned.
+
+### Azure Reserved IPs (Classic)
+
+Azure Classic deployments (V1) reserve IPs that persist after deletion.
+These appear in billing as `Microsoft.ClassicNetwork/reservedIps`:
+
+```bash
+az network list-usages --location eastus
+# Check for any classic network resources still billing
+az resource list --resource-type "Microsoft.ClassicNetwork/reservedIps"
+```
+
+Any classic reserved IP is both a cost item and a hygiene signal that
+legacy resources may still be present.
+
 ## GCP Idle Resource Patterns
 
 GCP has a distinct set of idle resource traps beyond the

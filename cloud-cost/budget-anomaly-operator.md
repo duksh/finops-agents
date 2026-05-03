@@ -194,6 +194,92 @@ def detect(segment_history: list[float], threshold: float = 3.0) -> dict | None:
 | **Speed** | Better alerts reduce time-to-detection-of-real-problems |
 | **Quality** | Fewer false positives = trust = action |
 
+## Azure Budget & Alert Deep-Dive
+
+### Azure Budgets API
+
+Azure budgets are managed via the Cost Management REST API and can be
+scoped to **Management Groups**, **Subscriptions**, or **Resource Groups**.
+Unlike AWS (account-scoped) or GCP (billing-account or project-scoped),
+Azure budgets support Resource Group scope — enabling per-team, per-application
+budget enforcement without requiring separate subscriptions.
+
+```bash
+# Create a subscription-level budget with forecast-based alert
+az consumption budget create \
+  --budget-name "platform-team-monthly" \
+  --amount 10000 \
+  --time-grain "Monthly" \
+  --start-date "2025-01-01" \
+  --end-date "2026-01-01" \
+  --scope "/subscriptions/MY-SUB-ID" \
+  --threshold 90 \
+  --threshold-type "Forecasted" \
+  --contact-emails "finops-team@example.com" \
+  --contact-roles "Owner"
+```
+
+Key parameters:
+- `--threshold-type "Forecasted"` creates a trajectory alert (fires when
+  Azure forecasts you'll hit the threshold, not when you've already spent it)
+- `--threshold-type "Actual"` creates a static threshold alert (fires when
+  current spend crosses the percentage)
+- Use both: one `Forecasted` at 100% for early warning, one `Actual` at 80%
+  and 100% for confirmation
+
+**Action Groups for notifications (beyond email):**
+
+Azure Budgets integrate with Action Groups, enabling Webhook, Logic App,
+Automation Runbook, and Azure Function notifications. Wire budget alerts to
+a Slack channel via Logic App or a webhook to your incident management tool:
+
+```bash
+# Create an Action Group with Slack webhook
+az monitor action-group create \
+  --name "finops-alerts" \
+  --resource-group "monitoring-rg" \
+  --short-name "finops" \
+  --webhook-receiver name="slack" \
+  uri="https://hooks.slack.com/services/..."
+```
+
+Then reference the Action Group in the budget `--contact-groups` parameter.
+
+**Scoping strategy:**
+
+- **Management Group scope:** use for org-wide cost governance (requires
+  Cost Management Reader at MG level)
+- **Subscription scope:** default for team/product budgets when subscriptions
+  map to teams
+- **Resource Group scope:** use when multiple teams share a subscription;
+  maps directly to FOCUS `SubAccountId` + resource group filter
+
+### Azure Cost Anomaly Detection (Defender for Cloud)
+
+Azure's native anomaly detection in Cost Management is available in the
+Azure Portal as "Cost Anomaly Alerts" (preview in some tenants):
+
+```bash
+# Enable anomaly alerts (requires Cost Management Contributor)
+az costmanagement alert create \
+  --scope "/subscriptions/MY-SUB-ID" \
+  --name "anomaly-alert" \
+  --definition-type "Budget" \
+  --threshold 0
+```
+
+For programmatic anomaly detection, use the Cost Management query API
+to pull daily `EffectiveCost` per service and run the same STL/z-score
+detector as described in the main workflow above. Group by
+`ServiceName` × `SubscriptionId` × `ResourceGroup` for actionable
+segmentation.
+
+**Tag inheritance caveat for Azure alerts:** Azure tags don't propagate
+to child resources automatically. A subscription-level budget with a tag
+filter will miss costs on resources that weren't explicitly tagged.
+Set Azure Policy to enforce tag inheritance before building
+tag-filtered budgets — otherwise the budget scope is silently incomplete.
+
 ## GCP Budget & Alert Deep-Dive
 
 ### Cloud Billing Budgets API

@@ -67,6 +67,78 @@ for chargeback or showback.
 - Always show utilization alongside allocation -- cost without utilization is incomplete
 - Treat multi-tenant clusters as the rule, not the exception
 
+## AKS-Specific Cost Allocation
+
+### AKS Cost Analysis add-on
+
+Azure Kubernetes Service provides a native Cost Analysis add-on that
+surfaces per-namespace, per-workload, and per-node-pool cost breakdowns
+directly in the Azure Portal and via the Azure Cost Management API.
+
+```bash
+# Enable the Cost Analysis add-on on an existing AKS cluster
+az aks update \
+  --name MY-CLUSTER \
+  --resource-group MY-RG \
+  --enable-cost-analysis
+```
+
+Requirements:
+- AKS cluster version 1.29+
+- `Standard` or `Premium` tier (not Free)
+- All pods must have resource requests set (pods without requests show
+  as "unallocated")
+
+The add-on emits cost data to Azure Cost Management with the dimension
+`kubernetes namespace` and `kubernetes label` -- making per-namespace
+costs queryable via the standard Cost Management API and visible in
+the Azure Portal cost views.
+
+**Map AKS namespaces to FOCUS `Tags`:** AKS namespace labels are
+surfaced in the billing export as resource tags once the Cost Analysis
+add-on is enabled. The tag key is `kubernetes namespace`.
+
+### Azure CNI vs kubenet network cost
+
+AKS supports two CNI plugins with different cost profiles:
+
+- **kubenet:** Pods use a private IP range; only node IPs are on the
+  VNet. Network traffic between pods on different nodes traverses the
+  node's external IP, potentially crossing AZ boundaries and incurring
+  inter-AZ traffic charges.
+- **Azure CNI:** Each pod gets a VNet IP. Pod-to-pod traffic stays on the
+  VNet, reducing inter-AZ costs for dense pod communication.
+
+For clusters with high east-west pod traffic (microservices, service
+mesh), Azure CNI typically reduces networking cost. For clusters with
+low east-west traffic, kubenet is cheaper (fewer VNet IPs needed).
+
+### OpenCost on AKS
+
+OpenCost works on AKS with the Azure cloud cost integration. Configure
+the Azure cost provider to pull per-node-hour costs from the Azure
+Retail Prices API:
+
+```yaml
+# values.yaml for OpenCost helm chart on AKS
+opencost:
+  exporter:
+    cloudProviderApiKey: ""  # not used for Azure
+  prometheus:
+    external:
+      enabled: true
+      url: "http://prometheus-server.monitoring.svc.cluster.local"
+  ui:
+    enabled: true
+azure:
+  billingAccountId: "MY-BILLING-ACCOUNT-ID"
+  offerDurableId: "MS-AZR-0003P"  # PAYG; use MS-AZR-0017P for EA
+  currency: "USD"
+```
+
+OpenCost surfaces per-namespace and per-deployment cost aligned to
+FOCUS `ServiceCategory='Compute'` once connected to Azure billing.
+
 ## GKE-Specific Cost Allocation
 
 ### Autopilot vs Standard cost model

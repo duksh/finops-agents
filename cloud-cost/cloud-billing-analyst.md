@@ -178,6 +178,81 @@ Use these only when FOCUS doesn't yet expose what you need.
 - Use management groups for cost roll-up, not just subscriptions
 - Azure Hybrid Benefit eligibility audits are often large and ignored
 
+### Azure Billing Deep-Dive
+
+**Agreement types and their export shapes:**
+
+| Agreement | Export API | Key difference |
+|---|---|---|
+| EA (Enterprise Agreement) | `/providers/Microsoft.Billing/billingAccounts/{id}/providers/Microsoft.CostManagement/exports` | `BillingAccountId` is the enrollment number |
+| MCA (Microsoft Customer Agreement) | Same endpoint, different scope | `BillingProfileId` is the invoice section; `InvoiceSection` maps to FOCUS `SubAccountId` |
+| CSP (Cloud Solution Provider) | Partner Center API | Reseller-specific; `CustomerTenantId` is the end customer |
+| PAYG | Azure Portal export only | No EA-style API; use Cost Management REST API |
+
+**Always verify the agreement type before writing any query.** Column
+names and hierarchy differ: EA uses `BillingAccountName` →
+`DepartmentName` → `AccountName` → `SubscriptionName`; MCA uses
+`BillingAccountName` → `BillingProfileName` → `InvoiceSectionName` →
+`SubscriptionName`. FOCUS normalizes these, but provider-native queries break.
+
+**Key native cost export columns → FOCUS mapping:**
+
+| Azure native column | FOCUS column | Notes |
+|---|---|---|
+| `SubscriptionId` | `SubAccountId` | Stable; use as join key |
+| `SubscriptionName` | `SubAccountName` | Mutable |
+| `ResourceGroup` | (no direct FOCUS equivalent) | Use as allocation dimension via `Tags` or external mapping |
+| `ResourceId` | `ResourceId` | Full ARM resource ID |
+| `ServiceName` | `ServiceName` | E.g., "Virtual Machines" |
+| `MeterCategory` | `ServiceCategory` approximation | More granular than FOCUS category |
+| `ChargeType` | `ChargeCategory` | `Usage` → `Usage`; `Purchase` → `Purchase`; `Refund` → `Adjustment` |
+| `UnitPrice` | `ContractedUnitPrice` | Pre-discount unit price |
+| `EffectivePrice` | (maps to) `EffectiveCost` / `ConsumedQuantity` | Post-commitment amortized rate |
+| `Tags` | `Tags` | JSON in both; Azure tags need policy enforcement to propagate |
+| `PayGPrice` | `ListUnitPrice` | Public on-demand rate |
+
+**Actual vs amortized export — critical distinction:**
+
+- **Actual export:** Reservation purchases appear as a lump sum in the
+  purchase month. `ChargeType='Purchase'`. Finance uses this for invoice
+  reconciliation.
+- **Amortized export:** Reservation cost is spread across the reservation
+  term. `ChargeType='Usage'` with `PricingModel='Reservation'`. Use this
+  for trend analysis and chargeback.
+- **FOCUS export (preferred):** Emits both `BilledCost` (actual) and
+  `EffectiveCost` (amortized) in the same row. No need to choose.
+
+**Azure FOCUS export setup:**
+
+```bash
+# Create a scheduled export to a storage account
+az costmanagement export create \
+  --name "focus-daily-export" \
+  --scope "/subscriptions/MY-SUB-ID" \
+  --storage-account-id "/subscriptions/.../storageAccounts/MY-SA" \
+  --storage-container "focus-exports" \
+  --storage-directory "focus" \
+  --type "FocusCost" \
+  --schedule-recurrence "Daily" \
+  --schedule-recurrence-period start="2025-01-01" end="2026-01-01" \
+  --time-frame "MonthToDate"
+```
+
+**Azure Hybrid Benefit audit query (Cost Management API):**
+
+AHB converts Windows Server and SQL Server VMs from pay-as-you-go
+licensing to Bring-Your-Own-License, typically saving 20-40% on those
+VM costs. It is frequently unclaimed because it requires opting in:
+
+```bash
+# Find VMs not using AHB (Windows VMs with standard OS cost)
+az vm list --query "[?storageProfile.osDisk.osType=='Windows' && licenseType!='Windows_Server'].{Name:name, ResourceGroup:resourceGroup, LicenseType:licenseType}" -o table
+```
+
+AHB is also available for SQL Server VMs, AKS Windows node pools,
+and Azure SQL Database. Run the eligibility audit before any Azure
+commitment purchase — AHB changes the effective discount math completely.
+
 ### GCP
 
 - Use the **detailed** billing export, not the standard one --
